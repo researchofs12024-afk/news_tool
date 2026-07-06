@@ -294,8 +294,8 @@ def build_mail_html(sel_df):
     """
     FF = "'맑은 고딕','Malgun Gothic',sans-serif"
     # 모든 텍스트 줄에 공통 적용되는 문단 스타일 (margin 0, 줄높이 통일)
-    P = f'margin:0;padding:0;line-height:1.5;font-family:{FF};'
-    BLANK = f'<p style="{P}font-size:10pt;">&nbsp;</p>'  # 균일 간격용 빈 줄
+    P = f'margin:0;padding:0;line-height:1.8;font-family:{FF};'
+    BLANK = f'<p style="{P}font-size:13pt;">&nbsp;</p>'  # 균일 간격용 빈 줄
 
     parts = [f'<div style="font-family:{FF};color:#000;">']
     for ci, cat in enumerate(MAIL_CATEGORIES):
