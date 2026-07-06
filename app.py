@@ -13,13 +13,14 @@ import requests
 import feedparser
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon="📰", layout="wide")
 
 DEFAULT_KEYWORDS = {
     "기존 키워드": [
         "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권", "물류센터 매매", "물류센터 공실", "오피스 이전 -영화",
-      "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전" "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
+      "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전", "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
       "오피스 펀드", "오피스 리츠", "공유 오피스", "물류센터 부동산", "데이터센터 개발", "데이터센터 투자", "증권 부동산 투자 해외 -분양", "보험업"
     ],
     "신규 키워드": [
@@ -286,48 +287,50 @@ def suggest_category(keyword: str, title: str) -> str:
 
 def build_mail_html(sel_df):
     """사내 배포 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑."""
-    # 전체 맑은 고딕. 개별 요소는 pt 단위로 크기 지정.
-    css_head = "font-family:'맑은 고딕','Malgun Gothic',sans-serif;color:#000;line-height:1.5;"
-    parts = [f'<div style="{css_head}">']
+    # 전체 맑은 고딕. 붙여넣기 호환을 위해 div 대신 p(문단) 기반으로 구성.
+    # 빈 여백 요소를 만들지 않고, 각 문단의 margin으로 간격을 내장 → 붙여넣을 때 빈 줄 안 생김.
+    FF = "'맑은 고딕','Malgun Gothic',sans-serif"
+    parts = [f'<div style="font-family:{FF};color:#000;">']
     for cat in MAIL_CATEGORIES:
         group = sel_df[sel_df["메일카테고리"] == cat]
         if group.empty:
             continue
-        # 카테고리 헤더: 12pt 볼드, 가로줄 없음
+        # 카테고리 헤더: 12pt 볼드
         parts.append(
-            '<div style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
-            'font-size:12pt;font-weight:bold;color:#000;'
-            'margin:24px 0 12px 0;">' + html.escape(cat) + '</div>'
+            f'<p style="font-family:{FF};font-size:12pt;font-weight:bold;'
+            'color:#000;margin:18pt 0 6pt 0;line-height:1.3;">'
+            + html.escape(cat) + '</p>'
         )
         for _, row in group.iterrows():
             title = html.escape(row["제목"])
             link = html.escape(row["링크"], quote=True)
             summary = html.escape(row.get("요약", "") or "")
             press = html.escape(row.get("언론사", "") or "")
-            # 1줄: 제목 — 10pt 볼드 밑줄 파란색 하이퍼링크, 새 창 열기
-            parts.append(
-                f'<div style="margin-bottom:2px;"><a href="{link}" '
-                'target="_blank" rel="noopener noreferrer" '
-                'style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
-                'font-size:10pt;font-weight:bold;color:#0000FF;'
-                'text-decoration:underline;">'
-                f'{title}</a></div>'
+
+            # 한 기사 = 하나의 문단(<p>). 제목/요약/언론사를 <br>로 이어 붙여
+            # 붙여넣기 시 기사 사이에만 간격이 생기고 내부엔 빈 줄이 안 생기게 함.
+            lines = []
+            lines.append(
+                f'<a href="{link}" target="_blank" rel="noopener noreferrer" '
+                f'style="font-family:{FF};font-size:10pt;font-weight:bold;'
+                'color:#0000FF;text-decoration:underline;">'
+                f'{title}</a>'
             )
-            # 2줄: 요약 — 10pt 일반(볼드 없음), 줄바꿈 반영
             if summary:
                 summary_html = summary.replace("\n", "<br>")
-                parts.append(
-                    '<div style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
-                    'font-size:10pt;font-weight:normal;color:#000;">'
-                    f'{summary_html}</div>'
+                lines.append(
+                    f'<span style="font-family:{FF};font-size:10pt;'
+                    f'font-weight:normal;color:#000;">{summary_html}</span>'
                 )
-            # 3줄: 언론사 — 8pt 검은색
             if press:
-                parts.append(
-                    '<div style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
-                    'font-size:8pt;color:#000;">' + press + '</div>'
+                lines.append(
+                    f'<span style="font-family:{FF};font-size:8pt;'
+                    f'color:#000;">{press}</span>'
                 )
-            parts.append('<div style="height:16px;"></div>')  # 기사 간 여백
+            parts.append(
+                f'<p style="font-family:{FF};margin:0 0 12pt 0;line-height:1.4;">'
+                + "<br>".join(lines) + '</p>'
+            )
     parts.append("</div>")
     return "".join(parts)
 
@@ -383,15 +386,58 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         st.session_state["mail_html"] = mail_html
 
     if "mail_html" in st.session_state:
-        st.subheader("메일 본문 미리보기")
-        st.caption("아래 미리보기가 실제 메일에 붙는 모습입니다. "
-                   "HTML 파일을 브라우저에서 열고 전체 복사(Ctrl+A→Ctrl+C) 후 메일 본문에 붙여넣으면 서식이 유지됩니다.")
-        st.html(st.session_state["mail_html"])
-        # HTML 다운로드
+        st.subheader("메일 본문")
+        st.caption("아래 [메일 본문 복사] 버튼을 누르면 서식이 그대로 클립보드에 담깁니다. "
+                   "메일 작성창에 붙여넣기(Ctrl+V)만 하면 됩니다. "
+                   "붙여넣은 뒤 빈 줄이 남으면 그 줄에서 Backspace 한 번으로 정리돼요.")
+
+        mail_html = st.session_state["mail_html"]
+        # 서식 있는 복사: HTML을 클립보드에 rich text로 넣는 버튼
+        import json as _json
+        html_js = _json.dumps(mail_html)  # JS 문자열로 안전 이스케이프
+        copy_widget = f"""
+        <div style="font-family:'맑은 고딕',sans-serif;">
+          <button id="copyBtn" style="padding:10px 18px;font-size:14px;
+              background:#ff4b4b;color:#fff;border:none;border-radius:6px;
+              cursor:pointer;width:100%;font-weight:bold;">
+            📋 메일 본문 복사 (서식 유지)
+          </button>
+          <span id="copyMsg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
+          <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
+          <div id="preview">{mail_html}</div>
+        </div>
+        <script>
+        const htmlStr = {html_js};
+        document.getElementById('copyBtn').addEventListener('click', async () => {{
+          try {{
+            const blob = new Blob([htmlStr], {{type: 'text/html'}});
+            const textBlob = new Blob([document.getElementById('preview').innerText],
+                                      {{type: 'text/plain'}});
+            await navigator.clipboard.write([
+              new ClipboardItem({{'text/html': blob, 'text/plain': textBlob}})
+            ]);
+            document.getElementById('copyMsg').innerText = '✓ 복사됨! 메일에 붙여넣으세요';
+          }} catch (e) {{
+            // 폴백: 선택 후 execCommand
+            const range = document.createRange();
+            range.selectNode(document.getElementById('preview'));
+            window.getSelection().removeAllRanges();
+            window.getSelection().addRange(range);
+            document.execCommand('copy');
+            window.getSelection().removeAllRanges();
+            document.getElementById('copyMsg').innerText = '✓ 복사됨 (폴백)';
+          }}
+        }});
+        </script>
+        """
+        st.components.v1.html(copy_widget, height=600, scrolling=True)
+
+
+        # 백업용 HTML 파일 다운로드도 유지
         full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
-                     "<body>" + st.session_state["mail_html"] + "</body></html>")
+                     "<body>" + mail_html + "</body></html>")
         st.download_button(
-            "📥 메일 HTML 다운로드", data=full_html.encode("utf-8"),
+            "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
             file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
             mime="text/html", use_container_width=True)
 
