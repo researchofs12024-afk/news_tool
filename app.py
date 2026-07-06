@@ -20,7 +20,7 @@ st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon=
 DEFAULT_KEYWORDS = {
     "기존 키워드": [
         "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권", "물류센터 매매", "물류센터 공실", "오피스 이전 -영화",
-      "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전", "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
+      "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전" "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
       "오피스 펀드", "오피스 리츠", "공유 오피스", "물류센터 부동산", "데이터센터 개발", "데이터센터 투자", "증권 부동산 투자 해외 -분양", "보험업"
     ],
     "신규 키워드": [
@@ -286,51 +286,61 @@ def suggest_category(keyword: str, title: str) -> str:
 
 
 def build_mail_html(sel_df):
-    """사내 배포 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑."""
-    # 전체 맑은 고딕. 붙여넣기 호환을 위해 div 대신 p(문단) 기반으로 구성.
-    # 빈 여백 요소를 만들지 않고, 각 문단의 margin으로 간격을 내장 → 붙여넣을 때 빈 줄 안 생김.
+    """사내 배포 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑.
+
+    메일 클라이언트(Knox/Outlook)는 <p>의 margin을 무시/축소하는 경우가 많아,
+    간격을 CSS margin이 아니라 '실제 빈 줄 문단'(&nbsp;)으로 만든다.
+    모든 문단의 margin은 0으로 통일 → 클라이언트가 재계산해도 균일 유지.
+    """
     FF = "'맑은 고딕','Malgun Gothic',sans-serif"
+    # 모든 텍스트 줄에 공통 적용되는 문단 스타일 (margin 0, 줄높이 통일)
+    P = f'margin:0;padding:0;line-height:1.5;font-family:{FF};'
+    BLANK = f'<p style="{P}font-size:10pt;">&nbsp;</p>'  # 균일 간격용 빈 줄
+
     parts = [f'<div style="font-family:{FF};color:#000;">']
-    for cat in MAIL_CATEGORIES:
+    for ci, cat in enumerate(MAIL_CATEGORIES):
         group = sel_df[sel_df["메일카테고리"] == cat]
         if group.empty:
             continue
+        # 카테고리 사이 구분 빈 줄 (첫 카테고리 앞에는 불필요)
+        if ci > 0 and len(parts) > 1:
+            parts.append(BLANK)
         # 카테고리 헤더: 12pt 볼드
         parts.append(
-            f'<p style="font-family:{FF};font-size:12pt;font-weight:bold;'
-            'color:#000;margin:18pt 0 6pt 0;line-height:1.3;">'
+            f'<p style="{P}font-size:12pt;font-weight:bold;color:#000;">'
             + html.escape(cat) + '</p>'
         )
+        parts.append(BLANK)  # 헤더와 첫 기사 사이
         for _, row in group.iterrows():
             title = html.escape(row["제목"])
             link = html.escape(row["링크"], quote=True)
             summary = html.escape(row.get("요약", "") or "")
             press = html.escape(row.get("언론사", "") or "")
 
-            # 한 기사 = 하나의 문단(<p>). 제목/요약/언론사를 <br>로 이어 붙여
-            # 붙여넣기 시 기사 사이에만 간격이 생기고 내부엔 빈 줄이 안 생기게 함.
-            lines = []
-            lines.append(
+            # 제목 줄
+            parts.append(
+                f'<p style="{P}">'
                 f'<a href="{link}" target="_blank" rel="noopener noreferrer" '
                 f'style="font-family:{FF};font-size:10pt;font-weight:bold;'
                 'color:#0000FF;text-decoration:underline;">'
-                f'{title}</a>'
+                f'{title}</a></p>'
             )
+            # 요약 줄 (여러 줄이면 각각 독립 문단으로 → 줄 간격 균일)
             if summary:
-                summary_html = summary.replace("\n", "<br>")
-                lines.append(
-                    f'<span style="font-family:{FF};font-size:10pt;'
-                    f'font-weight:normal;color:#000;">{summary_html}</span>'
-                )
+                for ln in summary.split("\n"):
+                    ln = ln.strip()
+                    if ln:
+                        parts.append(
+                            f'<p style="{P}font-size:10pt;font-weight:normal;'
+                            f'color:#000;">{ln}</p>'
+                        )
+            # 언론사 줄
             if press:
-                lines.append(
-                    f'<span style="font-family:{FF};font-size:8pt;'
-                    f'color:#000;">{press}</span>'
+                parts.append(
+                    f'<p style="{P}font-size:8pt;color:#000;">{press}</p>'
                 )
-            parts.append(
-                f'<p style="font-family:{FF};margin:0 0 12pt 0;line-height:1.4;">'
-                + "<br>".join(lines) + '</p>'
-            )
+            # 기사 사이 균일 간격
+            parts.append(BLANK)
     parts.append("</div>")
     return "".join(parts)
 
