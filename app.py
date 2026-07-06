@@ -266,40 +266,47 @@ MAIL_CATEGORIES = ["개발계획", "매입매각", "이전동향", "업계동향
 
 
 def build_mail_html(sel_df):
-    """사진 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑."""
-    css_head = (
-        "font-family:'맑은 고딕','Malgun Gothic',sans-serif;"
-        "font-size:14px;color:#000;line-height:1.5;"
-    )
+    """사내 배포 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑."""
+    # 전체 맑은 고딕. 개별 요소는 pt 단위로 크기 지정.
+    css_head = "font-family:'맑은 고딕','Malgun Gothic',sans-serif;color:#000;line-height:1.5;"
     parts = [f'<div style="{css_head}">']
     for cat in MAIL_CATEGORIES:
         group = sel_df[sel_df["메일카테고리"] == cat]
         if group.empty:
             continue
-        # 카테고리 헤더
+        # 카테고리 헤더: 12pt 볼드, 가로줄 없음
         parts.append(
-            '<div style="font-size:16px;font-weight:bold;color:#000;'
-            'border-bottom:1px solid #ccc;padding-bottom:4px;'
-            'margin:24px 0 14px 0;">' + html.escape(cat) + '</div>'
+            '<div style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
+            'font-size:12pt;font-weight:bold;color:#000;'
+            'margin:24px 0 12px 0;">' + html.escape(cat) + '</div>'
         )
         for _, row in group.iterrows():
             title = html.escape(row["제목"])
             link = html.escape(row["링크"], quote=True)
             summary = html.escape(row.get("요약", "") or "")
             press = html.escape(row.get("언론사", "") or "")
-            # 1줄: 제목(볼드·파랑·하이퍼링크)
+            # 1줄: 제목 — 10pt 볼드 밑줄 파란색 하이퍼링크
             parts.append(
                 f'<div style="margin-bottom:2px;"><a href="{link}" '
-                'style="color:#1a56db;font-weight:bold;text-decoration:none;">'
+                'style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
+                'font-size:10pt;font-weight:bold;color:#0000FF;'
+                'text-decoration:underline;">'
                 f'{title}</a></div>'
             )
-            # 2줄: 요약 (줄바꿈 그대로 반영)
+            # 2줄: 요약 — 10pt 일반(볼드 없음), 줄바꿈 반영
             if summary:
                 summary_html = summary.replace("\n", "<br>")
-                parts.append(f'<div style="color:#000;">{summary_html}</div>')
-            # 3줄: 언론사 (회색)
+                parts.append(
+                    '<div style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
+                    'font-size:10pt;font-weight:normal;color:#000;">'
+                    f'{summary_html}</div>'
+                )
+            # 3줄: 언론사 — 8pt 검은색
             if press:
-                parts.append(f'<div style="color:#888;font-size:13px;">{press}</div>')
+                parts.append(
+                    '<div style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
+                    'font-size:8pt;color:#000;">' + press + '</div>'
+                )
             parts.append('<div style="height:16px;"></div>')  # 기사 간 여백
     parts.append("</div>")
     return "".join(parts)
@@ -326,9 +333,10 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     edited = st.data_editor(
         st.session_state["editor_df"],
         hide_index=True, use_container_width=True, height=430,
-        column_order=["선택", "메일카테고리", "제목", "요약", "언론사", "키워드", "발행시각", "링크"],
+        column_order=["선택", "키워드", "메일카테고리", "제목", "요약", "언론사", "발행시각", "링크"],
         column_config={
             "선택": st.column_config.CheckboxColumn("선택", width="small"),
+            "키워드": st.column_config.TextColumn("키워드", width="small"),
             "메일카테고리": st.column_config.SelectboxColumn(
                 "메일 카테고리", options=MAIL_CATEGORIES, width="small"),
             "제목": st.column_config.TextColumn("제목", width="large"),
