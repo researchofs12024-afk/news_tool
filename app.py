@@ -264,6 +264,25 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
 # ═══════════════════════════════════════════════════════════════
 MAIL_CATEGORIES = ["개발계획", "매입매각", "이전동향", "업계동향", "시장동향", "정책"]
 
+# 키워드/제목에 아래 단어가 있으면 해당 카테고리로 초기 추천 (위에서부터 우선)
+CATEGORY_RULES = [
+    ("정책",   ["정책", "규제", "법", "제도", "정부", "국토부", "세제", "금리", "완화", "개정"]),
+    ("이전동향", ["이전", "사옥", "본사", "입주", "임차", "리모델링"]),
+    ("개발계획", ["개발", "복합개발", "신축", "착공", "준공", "분양", "인허가", "부지"]),
+    ("매입매각", ["매각", "매입", "매매", "인수", "거래", "딜", "클로징", "펀드", "리츠", "투자"]),
+    ("시장동향", ["시장", "전망", "공실", "임대료", "수익률", "가격", "지수", "동향"]),
+    ("업계동향", ["운용", "증권", "보험", "건설", "업계", "협회", "인사", "조직"]),
+]
+
+
+def suggest_category(keyword: str, title: str) -> str:
+    """키워드+제목 텍스트로 카테고리 초기 추천."""
+    text = f"{keyword} {title}"
+    for cat, words in CATEGORY_RULES:
+        if any(w in text for w in words):
+            return cat
+    return "업계동향"  # 어디에도 안 걸리면 기본
+
 
 def build_mail_html(sel_df):
     """사내 배포 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑."""
@@ -285,9 +304,10 @@ def build_mail_html(sel_df):
             link = html.escape(row["링크"], quote=True)
             summary = html.escape(row.get("요약", "") or "")
             press = html.escape(row.get("언론사", "") or "")
-            # 1줄: 제목 — 10pt 볼드 밑줄 파란색 하이퍼링크
+            # 1줄: 제목 — 10pt 볼드 밑줄 파란색 하이퍼링크, 새 창 열기
             parts.append(
                 f'<div style="margin-bottom:2px;"><a href="{link}" '
+                'target="_blank" rel="noopener noreferrer" '
                 'style="font-family:\'맑은 고딕\',\'Malgun Gothic\',sans-serif;'
                 'font-size:10pt;font-weight:bold;color:#0000FF;'
                 'text-decoration:underline;">'
@@ -325,7 +345,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             len(st.session_state.get("editor_df", [])) != len(base):
         edit = base.copy()
         edit.insert(0, "선택", False)
-        edit["메일카테고리"] = MAIL_CATEGORIES[1]  # 기본 '매입매각'
+        edit["메일카테고리"] = edit.apply(
+            lambda r: suggest_category(str(r.get("키워드", "")), str(r.get("제목", ""))), axis=1)
         # 요약 초안: 원문 앞부분 다듬어 초안으로
         edit["요약"] = edit["요약초안"].fillna("").apply(lambda s: s[:120])
         st.session_state["editor_df"] = edit
