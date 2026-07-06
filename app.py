@@ -3,6 +3,7 @@
 """
 
 import io
+import re
 import time
 import html
 import datetime as dt
@@ -18,7 +19,7 @@ st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon=
 DEFAULT_KEYWORDS = {
     "기존 키워드": [
         "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권", "물류센터 매매", "물류센터 공실", "오피스 이전 -영화",
-      "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전", "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
+      "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전" "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
       "오피스 펀드", "오피스 리츠", "공유 오피스", "물류센터 부동산", "데이터센터 개발", "데이터센터 투자", "증권 부동산 투자 해외 -분양", "보험업"
     ],
     "신규 키워드": [
@@ -31,9 +32,12 @@ KST = dt.timezone(dt.timedelta(hours=9))
 
 
 def clean(text: str) -> str:
-    """네이버 응답의 <b> 태그, HTML 엔티티 제거."""
-    text = text.replace("<b>", "").replace("</b>", "")
-    return html.unescape(text).strip()
+    """HTML 태그·엔티티 제거 후 공백 정리."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text)  # 모든 태그 제거
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ── 네이버 뉴스 검색 API ──────────────────────────────────────
@@ -82,6 +86,7 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
                 "언론사": "",
                 "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
                 "링크": it.get("originallink") or it.get("link", ""),
+                "요약초안": clean(it.get("description", "")),
                 "출처": "네이버",
             })
         if stop:
@@ -115,7 +120,9 @@ def fetch_google(keyword, category, within_days, hours_limit):
             "카테고리": category, "키워드": keyword,
             "제목": title.strip(), "언론사": source.strip(),
             "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
-            "링크": e.link, "출처": "구글",
+            "링크": e.link,
+            "요약초안": clean(e.get("summary", "")) if e.get("summary") else "",
+            "출처": "구글",
         })
     return rows
 
@@ -233,23 +240,131 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
     df = dedup(pd.DataFrame(all_rows))
     if df.empty:
         st.warning("수집된 기사가 없습니다. 키워드/기간/API 키를 확인하세요.")
+        st.session_state.pop("collected", None)
     else:
         # 검색한 키워드 순서대로 정렬 (같은 키워드 내에서는 최신순)
         kw_rank = {kw: i for i, kw in enumerate(kw_order)}
         df["_kw_rank"] = df["키워드"].map(kw_rank).fillna(len(kw_order)).astype(int)
         df = df.sort_values(["_kw_rank", "발행시각"], ascending=[True, False])
         df = df.drop(columns="_kw_rank").reset_index(drop=True)
+        st.session_state["collected"] = df  # 배포 편집에서 사용
 
         st.success(f"총 {len(df)}건 (중복 제거 후) · "
                    f"네이버 {sum(df['출처']=='네이버')} / 구글 {sum(df['출처']=='구글')}")
         st.dataframe(df["키워드"].value_counts().rename_axis("키워드").reset_index(name="건수"),
                      hide_index=True)
-        st.data_editor(df, hide_index=True, use_container_width=True, disabled=True,
-                       column_config={"링크": st.column_config.LinkColumn("링크", display_text="열기")})
         fname = f"뉴스클리핑_{dt.datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button("📥 엑셀 다운로드", to_excel_bytes(df), file_name=fname,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           type="primary", use_container_width=True)
+                           use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 배포 편집 섹션 — 기사 선택 → 카테고리 분류 → 요약 → 메일 HTML 생성
+# ═══════════════════════════════════════════════════════════════
+MAIL_CATEGORIES = ["개발계획", "매입매각", "이전동향", "업계동향", "시장동향", "정책"]
+
+
+def build_mail_html(sel_df):
+    """사진 포맷대로 메일용 HTML 생성. 카테고리별 그룹핑."""
+    css_head = (
+        "font-family:'맑은 고딕','Malgun Gothic',sans-serif;"
+        "font-size:14px;color:#000;line-height:1.5;"
+    )
+    parts = [f'<div style="{css_head}">']
+    for cat in MAIL_CATEGORIES:
+        group = sel_df[sel_df["메일카테고리"] == cat]
+        if group.empty:
+            continue
+        # 카테고리 헤더
+        parts.append(
+            '<div style="font-size:16px;font-weight:bold;color:#000;'
+            'border-bottom:1px solid #ccc;padding-bottom:4px;'
+            'margin:24px 0 14px 0;">' + html.escape(cat) + '</div>'
+        )
+        for _, row in group.iterrows():
+            title = html.escape(row["제목"])
+            link = html.escape(row["링크"], quote=True)
+            summary = html.escape(row.get("요약", "") or "")
+            press = html.escape(row.get("언론사", "") or "")
+            # 1줄: 제목(볼드·파랑·하이퍼링크)
+            parts.append(
+                f'<div style="margin-bottom:2px;"><a href="{link}" '
+                'style="color:#1a56db;font-weight:bold;text-decoration:none;">'
+                f'{title}</a></div>'
+            )
+            # 2줄: 요약 (줄바꿈 그대로 반영)
+            if summary:
+                summary_html = summary.replace("\n", "<br>")
+                parts.append(f'<div style="color:#000;">{summary_html}</div>')
+            # 3줄: 언론사 (회색)
+            if press:
+                parts.append(f'<div style="color:#888;font-size:13px;">{press}</div>')
+            parts.append('<div style="height:16px;"></div>')  # 기사 간 여백
+    parts.append("</div>")
+    return "".join(parts)
+
+
+if "collected" in st.session_state and not st.session_state["collected"].empty:
+    st.divider()
+    st.header("✉️ 메일 배포용 정리")
+    st.caption("배포할 기사를 선택하고, 카테고리를 지정한 뒤 요약을 다듬으세요. "
+               "요약 초안은 기사 원문 일부에서 자동으로 채워집니다.")
+
+    base = st.session_state["collected"].copy()
+
+    # 편집용 표 준비: 선택 체크박스, 메일카테고리, 요약(초안 자동 채움)
+    if "editor_df" not in st.session_state or \
+            len(st.session_state.get("editor_df", [])) != len(base):
+        edit = base.copy()
+        edit.insert(0, "선택", False)
+        edit["메일카테고리"] = MAIL_CATEGORIES[1]  # 기본 '매입매각'
+        # 요약 초안: 원문 앞부분 다듬어 초안으로
+        edit["요약"] = edit["요약초안"].fillna("").apply(lambda s: s[:120])
+        st.session_state["editor_df"] = edit
+
+    edited = st.data_editor(
+        st.session_state["editor_df"],
+        hide_index=True, use_container_width=True, height=430,
+        column_order=["선택", "메일카테고리", "제목", "요약", "언론사", "키워드", "발행시각", "링크"],
+        column_config={
+            "선택": st.column_config.CheckboxColumn("선택", width="small"),
+            "메일카테고리": st.column_config.SelectboxColumn(
+                "메일 카테고리", options=MAIL_CATEGORIES, width="small"),
+            "제목": st.column_config.TextColumn("제목", width="large"),
+            "요약": st.column_config.TextColumn("요약 (직접 수정)", width="large"),
+            "언론사": st.column_config.TextColumn("언론사", width="small"),
+            "링크": st.column_config.LinkColumn("링크", display_text="열기"),
+            "요약초안": None,  # 숨김
+            "카테고리": None, "출처": None,
+        },
+        disabled=["제목", "언론사", "키워드", "발행시각", "링크"],
+        key="editor",
+    )
+
+    sel = edited[edited["선택"] == True].copy()
+    st.write(f"선택된 기사: **{len(sel)}건**")
+
+    if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
+                 disabled=sel.empty):
+        # 카테고리 순 → 발행시각 순 정렬
+        sel["_c"] = sel["메일카테고리"].map({c: i for i, c in enumerate(MAIL_CATEGORIES)})
+        sel = sel.sort_values(["_c", "발행시각"], ascending=[True, False])
+        mail_html = build_mail_html(sel)
+        st.session_state["mail_html"] = mail_html
+
+    if "mail_html" in st.session_state:
+        st.subheader("메일 본문 미리보기")
+        st.caption("아래 미리보기가 실제 메일에 붙는 모습입니다. "
+                   "HTML 파일을 브라우저에서 열고 전체 복사(Ctrl+A→Ctrl+C) 후 메일 본문에 붙여넣으면 서식이 유지됩니다.")
+        st.html(st.session_state["mail_html"])
+        # HTML 다운로드
+        full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
+                     "<body>" + st.session_state["mail_html"] + "</body></html>")
+        st.download_button(
+            "📥 메일 HTML 다운로드", data=full_html.encode("utf-8"),
+            file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
+            mime="text/html", use_container_width=True)
 
 with st.expander("ℹ️ 네이버 API 키 발급 & 배포 방법"):
     st.markdown("""
