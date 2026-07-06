@@ -381,7 +381,7 @@ def build_mail_html(sel_df):
                             f'color:#000;">{ln}</p>'
                         )
             # 언론사 줄 — 플레이스홀더면 빨간색으로 눈에 띄게
-            press_color = "#c00000" if press == html.escape(PRESS_PLACEHOLDER) else "#c00000"
+            press_color = "#0000FF" if press == html.escape(PRESS_PLACEHOLDER) else "#0000FF"
             parts.append(
                 f'<p style="{P}font-size:8pt;color:{press_color};">{press}</p>'
             )
