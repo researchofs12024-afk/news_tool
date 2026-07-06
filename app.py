@@ -1,16 +1,5 @@
 """
 상업용 부동산 뉴스 클리핑 v2 (네이버 뉴스 API + 구글 뉴스 RSS 통합)
-
-- 네이버: 개발자센터 검색 API (합법·안정). 키워드당 최대 1,000건, 하루 25,000회 쿼터.
-- 구글: 뉴스 RSS. 네이버가 놓친 기사 보완.
-- 두 소스 합쳐 중복 제거 → 누락 최소화 → 엑셀 다운로드.
-- 소프트웨어 설치 없이 Streamlit Cloud에서 웹으로 실행.
-
-★ 네이버 API 키 발급 (1회):
-  1) developers.naver.com 로그인 → Application → 애플리케이션 등록
-  2) 사용 API: '검색' 선택
-  3) 발급된 Client ID / Client Secret 를 아래 사이드바에 입력
-     (Streamlit Cloud 배포 시 Secrets에 저장 권장 — 하단 안내 참고)
 """
 
 import io
@@ -28,14 +17,14 @@ st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon=
 
 DEFAULT_KEYWORDS = {
     "기존 키워드": [
-        "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권", "물류센터 매매", "물류센터 공실", "오피스 이전 -영화", 
+        "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권", "물류센터 매매", "물류센터 공실", "오피스 이전 -영화",
       "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전" "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
       "오피스 펀드", "오피스 리츠", "공유 오피스", "물류센터 부동산", "데이터센터 개발", "데이터센터 투자", "증권 부동산 투자 해외 -분양", "보험업"
     ],
     "신규 키워드": [
-        
+
     ],
-    
+
 }
 
 KST = dt.timezone(dt.timedelta(hours=9))
@@ -175,10 +164,7 @@ with st.sidebar:
             csecret = st.secrets.get("NAVER_CLIENT_SECRET", "")
         except Exception:
             cid = csecret = ""
-        if cid and csecret:
-            st.success(f"✅ 네이버 키 로드됨 (ID: {cid[:4]}…)")
-        else:
-            st.warning("Secrets에 키가 없습니다. 아래 직접 입력하거나 Settings→Secrets에 저장하세요.")
+        if not (cid and csecret):
             cid = st.text_input("네이버 Client ID", type="password")
             csecret = st.text_input("네이버 Client Secret", type="password")
 
@@ -206,11 +192,14 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
 
     hours_limit = 24 if strict24 else None
     all_rows, errors, diags = [], [], []
+    kw_order = []  # 검색한 키워드 순서 기록
     total = sum(len(v) for v in edited.values())
     prog = st.progress(0.0, text="수집 중...")
     done = 0
     for cat, kws in edited.items():
         for kw in kws:
+            if kw not in kw_order:
+                kw_order.append(kw)
             if use_naver:
                 d = {}
                 r, err = fetch_naver(kw, cat, cid, csecret, hours_limit, diag=d)
@@ -245,10 +234,15 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
     if df.empty:
         st.warning("수집된 기사가 없습니다. 키워드/기간/API 키를 확인하세요.")
     else:
-        df = df.sort_values(["카테고리", "발행시각"], ascending=[True, False]).reset_index(drop=True)
+        # 검색한 키워드 순서대로 정렬 (같은 키워드 내에서는 최신순)
+        kw_rank = {kw: i for i, kw in enumerate(kw_order)}
+        df["_kw_rank"] = df["키워드"].map(kw_rank).fillna(len(kw_order)).astype(int)
+        df = df.sort_values(["_kw_rank", "발행시각"], ascending=[True, False])
+        df = df.drop(columns="_kw_rank").reset_index(drop=True)
+
         st.success(f"총 {len(df)}건 (중복 제거 후) · "
                    f"네이버 {sum(df['출처']=='네이버')} / 구글 {sum(df['출처']=='구글')}")
-        st.dataframe(df["카테고리"].value_counts().rename_axis("카테고리").reset_index(name="건수"),
+        st.dataframe(df["키워드"].value_counts().rename_axis("키워드").reset_index(name="건수"),
                      hide_index=True)
         st.data_editor(df, hide_index=True, use_container_width=True, disabled=True,
                        column_config={"링크": st.column_config.LinkColumn("링크", display_text="열기")})
