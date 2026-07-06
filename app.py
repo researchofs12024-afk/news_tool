@@ -31,6 +31,8 @@ DEFAULT_KEYWORDS = {
 
 KST = dt.timezone(dt.timedelta(hours=9))
 
+PRESS_PLACEHOLDER = "(언론사 기입 필요)"
+
 
 def clean(text: str) -> str:
     """HTML 태그·엔티티 제거 후 공백 정리."""
@@ -84,7 +86,7 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
             rows.append({
                 "카테고리": category, "키워드": keyword,
                 "제목": clean(it.get("title", "")),
-                "언론사": "",
+                "언론사": press_from_link(it.get("originallink") or it.get("link", "")),
                 "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
                 "링크": it.get("originallink") or it.get("link", ""),
                 "요약초안": clean(it.get("description", "")),
@@ -98,6 +100,44 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
         diag["newest"] = newest_pub.strftime("%Y-%m-%d %H:%M") if newest_pub else "없음"
         diag["kept"] = len(rows)
     return rows, None
+
+
+# 링크 도메인 → 언론사명 매핑 (네이버 API가 언론사명을 안 주므로 링크에서 유추)
+PRESS_DOMAIN_MAP = {
+    "hankyung.com": "한국경제", "mk.co.kr": "매일경제", "edaily.co.kr": "이데일리",
+    "mt.co.kr": "머니투데이", "sedaily.com": "서울경제", "fnnews.com": "파이낸셜뉴스",
+    "chosun.com": "조선일보", "biz.chosun.com": "조선비즈", "donga.com": "동아일보",
+    "joongang.co.kr": "중앙일보", "joins.com": "중앙일보", "hani.co.kr": "한겨레",
+    "khan.co.kr": "경향신문", "seoul.co.kr": "서울신문", "kmib.co.kr": "국민일보",
+    "munhwa.com": "문화일보", "hankookilbo.com": "한국일보", "segye.com": "세계일보",
+    "asiae.co.kr": "아시아경제", "ajunews.com": "아주경제", "newsis.com": "뉴시스",
+    "yna.co.kr": "연합뉴스", "yonhapnews.co.kr": "연합뉴스", "news1.kr": "뉴스1",
+    "heraldcorp.com": "헤럴드경제", "etnews.com": "전자신문", "dt.co.kr": "디지털타임스",
+    "thebell.co.kr": "더벨", "investchosun.com": "인베스트조선", "dealsite.co.kr": "딜사이트",
+    "businesspost.co.kr": "비즈니스포스트", "bizhankook.com": "비즈한국",
+    "wowtv.co.kr": "한국경제TV", "moneys.co.kr": "머니S", "ceoscoredaily.com": "CEO스코어데일리",
+    "housingnews.co.kr": "하우징헤럴드", "r-e.kr": "부동산일보", "kukinews.com": "쿠키뉴스",
+    "newspim.com": "뉴스핌", "ebn.co.kr": "EBN", "ibabo.co.kr": "이바보",
+    "tfmedia.co.kr": "조세금융신문", "g-enews.com": "글로벌이코노믹",
+}
+
+
+def press_from_link(url: str) -> str:
+    """기사 링크 도메인에서 언론사명 유추. 못 찾으면 플레이스홀더 반환."""
+    if not url:
+        return PRESS_PLACEHOLDER
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+        host = host.replace("www.", "")
+        # 정확 매칭 우선, 없으면 부분 매칭
+        if host in PRESS_DOMAIN_MAP:
+            return PRESS_DOMAIN_MAP[host]
+        for domain, name in PRESS_DOMAIN_MAP.items():
+            if domain in host:
+                return name
+    except Exception:
+        pass
+    return PRESS_PLACEHOLDER
 
 
 # ── 구글 뉴스 RSS ────────────────────────────────────────────
@@ -117,9 +157,12 @@ def fetch_google(keyword, category, within_days, hours_limit):
         source = e.get("source", {}).get("title", "")
         if not source and " - " in title:
             title, source = title.rsplit(" - ", 1)
+        source = source.strip()
+        if not source:
+            source = press_from_link(e.link)
         rows.append({
             "카테고리": category, "키워드": keyword,
-            "제목": title.strip(), "언론사": source.strip(),
+            "제목": title.strip(), "언론사": source,
             "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
             "링크": e.link,
             "요약초안": clean(e.get("summary", "")) if e.get("summary") else "",
@@ -316,6 +359,9 @@ def build_mail_html(sel_df):
             link = html.escape(row["링크"], quote=True)
             summary = html.escape(row.get("요약", "") or "")
             press = html.escape(row.get("언론사", "") or "")
+            # 언론사가 비어있으면 플레이스홀더로 대체
+            if not press.strip():
+                press = html.escape(PRESS_PLACEHOLDER)
 
             # 제목 줄
             parts.append(
@@ -334,11 +380,11 @@ def build_mail_html(sel_df):
                             f'<p style="{P}font-size:10pt;font-weight:normal;'
                             f'color:#000;">{ln}</p>'
                         )
-            # 언론사 줄
-            if press:
-                parts.append(
-                    f'<p style="{P}font-size:8pt;color:#000;">{press}</p>'
-                )
+            # 언론사 줄 — 플레이스홀더면 빨간색으로 눈에 띄게
+            press_color = "#c00000" if press == html.escape(PRESS_PLACEHOLDER) else "#000"
+            parts.append(
+                f'<p style="{P}font-size:8pt;color:{press_color};">{press}</p>'
+            )
             # 기사 사이 균일 간격
             parts.append(BLANK)
     parts.append("</div>")
@@ -349,7 +395,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
     st.caption("배포할 기사를 선택하고, 카테고리를 지정한 뒤 요약을 다듬으세요. "
-               "요약 초안은 기사 원문 일부에서 자동으로 채워집니다.")
+               "요약 초안은 기사 원문 일부에서 자동으로 채워집니다. "
+               f"언론사가 '{PRESS_PLACEHOLDER}'로 표시된 기사는 직접 입력해 주세요.")
 
     base = st.session_state["collected"].copy()
 
@@ -360,6 +407,9 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         edit.insert(0, "선택", False)
         edit["메일카테고리"] = edit.apply(
             lambda r: suggest_category(str(r.get("키워드", "")), str(r.get("제목", ""))), axis=1)
+        # 언론사 비어있으면 플레이스홀더로 채움
+        edit["언론사"] = edit["언론사"].fillna("").apply(
+            lambda s: s if str(s).strip() else PRESS_PLACEHOLDER)
         # 요약 초안: 원문 앞부분 다듬어 초안으로
         edit["요약"] = edit["요약초안"].fillna("").apply(lambda s: s[:120])
         st.session_state["editor_df"] = edit
@@ -375,17 +425,23 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 "메일 카테고리", options=MAIL_CATEGORIES, width="small"),
             "제목": st.column_config.TextColumn("제목", width="large"),
             "요약": st.column_config.TextColumn("요약 (직접 수정)", width="large"),
-            "언론사": st.column_config.TextColumn("언론사", width="small"),
+            "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width="small"),
             "링크": st.column_config.LinkColumn("링크", display_text="열기"),
             "요약초안": None,  # 숨김
             "카테고리": None, "출처": None,
         },
-        disabled=["제목", "언론사", "키워드", "발행시각", "링크"],
+        disabled=["제목", "키워드", "발행시각", "링크"],
         key="editor",
     )
 
     sel = edited[edited["선택"] == True].copy()
     st.write(f"선택된 기사: **{len(sel)}건**")
+    # 언론사 미기입 경고
+    if not sel.empty:
+        need_press = sel[sel["언론사"].astype(str).str.strip().isin(["", PRESS_PLACEHOLDER])]
+        if not need_press.empty:
+            st.warning(f"⚠️ 선택한 기사 중 {len(need_press)}건은 언론사가 비어 있습니다. "
+                       "표의 '언론사' 칸을 직접 채우면 메일에 반영됩니다.")
 
     if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
                  disabled=sel.empty):
@@ -477,5 +533,5 @@ openpyxl
 
 **참고**
 - 네이버 API는 키워드당 최대 1,000건까지. 부동산 키워드는 24시간 내 이 상한을 거의 안 넘어 사실상 전수 수집.
-- 네이버 API는 언론사명을 안 줍니다(링크로 유추). 언론사명이 꼭 필요하면 구글 RSS 결과의 언론사 칼럼을 참고하세요.
+- 네이버 API는 언론사명을 안 줘서 링크 도메인으로 유추합니다. 못 찾으면 '(언론사 기입 필요)'로 표시되니 표에서 직접 채우세요.
 """)
