@@ -51,10 +51,13 @@ def clean(text: str) -> str:
 
 
 # ── 네이버 뉴스 검색 API ──────────────────────────────────────
-def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10):
+def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag=None):
+    """diag: dict를 넘기면 진단 정보를 채워줌 (상태코드, 원본건수, 최신기사시각 등)."""
     rows = []
     now = dt.datetime.now(KST)
     headers = {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csecret}
+    raw_count = 0
+    newest_pub = None
     for page in range(max_pages):
         start = page * 100 + 1
         if start > 1000:  # API 상한
@@ -63,19 +66,24 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10):
         try:
             r = requests.get("https://openapi.naver.com/v1/search/news.json",
                              headers=headers, params=params, timeout=10)
+            if diag is not None:
+                diag["status"] = r.status_code
             if r.status_code != 200:
-                # 401/403 등: 키 오류 또는 쿼터 초과
-                return rows, f"네이버 API 오류 {r.status_code}: {r.text[:120]}"
+                # 401: 인증실패(키오류) / 403: 권한없음(검색API 미등록) / 429: 쿼터초과
+                return rows, f"네이버 API 오류 {r.status_code}: {r.text[:150]}"
             items = r.json().get("items", [])
         except Exception as e:
             return rows, f"네이버 요청 실패: {e}"
         if not items:
             break
+        raw_count += len(items)
         stop = False
         for it in items:
             pub = None
             try:
                 pub = dt.datetime.strptime(it["pubDate"], "%a, %d %b %Y %H:%M:%S %z").astimezone(KST)
+                if newest_pub is None or pub > newest_pub:
+                    newest_pub = pub
             except Exception:
                 pass
             # 최신순 정렬이므로 24시간 초과가 나오면 이후는 볼 필요 없음
@@ -85,7 +93,7 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10):
             rows.append({
                 "카테고리": category, "키워드": keyword,
                 "제목": clean(it.get("title", "")),
-                "언론사": "",  # 네이버 API는 언론사명 미제공 → 링크로 유추 가능
+                "언론사": "",
                 "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
                 "링크": it.get("originallink") or it.get("link", ""),
                 "출처": "네이버",
@@ -93,6 +101,10 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10):
         if stop:
             break
         time.sleep(0.1)
+    if diag is not None:
+        diag["raw_count"] = raw_count
+        diag["newest"] = newest_pub.strftime("%Y-%m-%d %H:%M") if newest_pub else "없음"
+        diag["kept"] = len(rows)
     return rows, None
 
 
@@ -160,10 +172,16 @@ with st.sidebar:
 
     cid = csecret = ""
     if use_naver:
-        # Streamlit Secrets에 저장했으면 자동 로드, 없으면 직접 입력
-        cid = st.secrets.get("NAVER_CLIENT_ID", "") if hasattr(st, "secrets") else ""
-        csecret = st.secrets.get("NAVER_CLIENT_SECRET", "") if hasattr(st, "secrets") else ""
-        if not cid:
+        # Streamlit Secrets에서 안전하게 로드
+        try:
+            cid = st.secrets.get("NAVER_CLIENT_ID", "")
+            csecret = st.secrets.get("NAVER_CLIENT_SECRET", "")
+        except Exception:
+            cid = csecret = ""
+        if cid and csecret:
+            st.success(f"✅ 네이버 키 로드됨 (ID: {cid[:4]}…)")
+        else:
+            st.warning("Secrets에 키가 없습니다. 아래 직접 입력하거나 Settings→Secrets에 저장하세요.")
             cid = st.text_input("네이버 Client ID", type="password")
             csecret = st.text_input("네이버 Client Secret", type="password")
 
@@ -190,15 +208,18 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
         st.stop()
 
     hours_limit = 24 if strict24 else None
-    all_rows, errors = [], []
+    all_rows, errors, diags = [], [], []
     total = sum(len(v) for v in edited.values())
     prog = st.progress(0.0, text="수집 중...")
     done = 0
     for cat, kws in edited.items():
         for kw in kws:
             if use_naver:
-                r, err = fetch_naver(kw, cat, cid, csecret, hours_limit)
+                d = {}
+                r, err = fetch_naver(kw, cat, cid, csecret, hours_limit, diag=d)
                 all_rows.extend(r)
+                d["키워드"] = kw
+                diags.append(d)
                 if err:
                     errors.append(err)
             if use_google:
@@ -208,7 +229,20 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
     prog.empty()
 
     if errors:
-        st.warning("일부 오류:\n" + "\n".join(set(errors)))
+        st.error("네이버 API 오류:\n\n" + "\n\n".join(set(errors)))
+
+    # 네이버 진단 패널 — 왜 0건인지 원인 파악용
+    if use_naver and diags:
+        naver_total = sum(1 for row in all_rows if row.get("출처") == "네이버")
+        with st.expander("🔎 네이버 수집 진단 (0건일 때 원인 확인)", expanded=(naver_total == 0)):
+            dd = pd.DataFrame(diags)
+            cols_order = [c for c in ["키워드", "status", "raw_count", "kept", "newest"] if c in dd.columns]
+            dd = dd[cols_order].rename(columns={
+                "status": "HTTP상태", "raw_count": "네이버원본건수",
+                "kept": "24h내채택", "newest": "최신기사시각"})
+            st.dataframe(dd, hide_index=True, use_container_width=True)
+            st.caption("HTTP상태 200=정상 / 401=키오류 / 403=검색API미등록 / 429=쿼터초과. "
+                       "원본건수는 있는데 24h내채택이 0이면 → 24시간 필터 때문. '정확히 24시간 이내만'을 끄거나 기간을 늘리세요.")
 
     df = dedup(pd.DataFrame(all_rows))
     if df.empty:
