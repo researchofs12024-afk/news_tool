@@ -481,16 +481,16 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         st.components.v1.html(preview_html, height=500, scrolling=True)
 
 
-        # 백업용 HTML 파일 다운로드도 유지
-        full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
-                     "<body>" + mail_html + "</body></html>")
-        st.download_button(
-            "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
-            file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
-            mime="text/html", use_container_width=True)
+    # 백업용 HTML 파일 다운로드도 유지
+    full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
+                 "<body>" + mail_html + "</body></html>")
+    st.download_button(
+        "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
+        file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
+        mime="text/html", use_container_width=True)
 
-with st.expander("ℹ️ 네이버 API 키 발급 & 배포 방법"):
-    st.markdown("""
+    with st.expander("ℹ️ 네이버 API 키 발급 & 배포 방법"):
+        st.markdown("""
 **1. 네이버 API 키 발급 (무료, 1회)**
 - developers.naver.com 로그인 → 상단 Application → 애플리케이션 등록
 - 사용 API: **검색** 선택 / 환경: WEB 설정 (URL은 배포 후 Streamlit 주소)
