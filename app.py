@@ -458,39 +458,57 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                    "붙여넣은 뒤 빈 줄이 남으면 그 줄에서 Backspace 한 번으로 정리돼요.")
 
         mail_html = st.session_state["mail_html"]
-        # ☆ 수정된 부분: 버튼을 메일 본문과 분리 ☆
-        # 버튼과 메시지를 별도 행에 배치 (고정 위치)
-        btn_col1, btn_col2 = st.columns([4, 1])
+        # 서식 있는 복사: HTML을 클립보드에 rich text로 넣는 버튼
+        import json as _json
+        html_js = _json.dumps(mail_html)  # JS 문자열로 안전 이스케이프
+        copy_widget = f"""
+        <div style="font-family:'맑은 고딕',sans-serif;">
+          <button id="copyBtn" style="padding:10px 18px;font-size:14px;
+              background:#ff4b4b;color:#fff;border:none;border-radius:6px;
+              cursor:pointer;width:100%;font-weight:bold;">
+            📋 메일 본문 복사 (서식 유지)
+          </button>
+          <span id="copyMsg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
+          <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
+          <div id="preview">{mail_html}</div>
+        </div>
+        <script>
+        const htmlStr = {html_js};
+        document.getElementById('copyBtn').addEventListener('click', async () => {{
+          try {{
+            const blob = new Blob([htmlStr], {{type: 'text/html'}});
+            const textBlob = new Blob([document.getElementById('preview').innerText],
+                                      {{type: 'text/plain'}});
+            await navigator.clipboard.write([
+              new ClipboardItem({{'text/html': blob, 'text/plain': textBlob}})
+            ]);
+            document.getElementById('copyMsg').innerText = '✓ 복사됨! 메일에 붙여넣으세요';
+          }} catch (e) {{
+            // 폴백: 선택 후 execCommand
+            const range = document.createRange();
+            range.selectNode(document.getElementById('preview'));
+            window.getSelection().removeAllRanges();
+            window.getSelection().addRange(range);
+            document.execCommand('copy');
+            window.getSelection().removeAllRanges();
+            document.getElementById('copyMsg').innerText = '✓ 복사됨 (폴백)';
+          }}
+        }});
+        </script>
+        """
+        st.components.v1.html(copy_widget, height=600, scrolling=True)
 
-        with btn_col1:
-            copy_btn = st.button(
-                "📋 메일 본문 복사 (서식 유지)",
-                use_container_width=True,
-                key="copy_mail_btn"
-            )
 
-        msg_placeholder = btn_col2.empty()
+        # 백업용 HTML 파일 다운로드도 유지
+        full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
+                     "<body>" + mail_html + "</body></html>")
+        st.download_button(
+            "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
+            file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
+            mime="text/html", use_container_width=True)
 
-        if copy_btn:
-            st.session_state["copy_success"] = True
-            msg_placeholder.success("✓ 복사됨!")
-
-        st.divider()  # 분리선 추가
-
-        # 메일 본문 미리보기만 렌더링 (스크롤 가능)
-        st.components.v1.html(preview_html, height=500, scrolling=True)
-
-
-    # 백업용 HTML 파일 다운로드도 유지
-    full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
-                 "<body>" + mail_html + "</body></html>")
-    st.download_button(
-        "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
-        file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
-        mime="text/html", use_container_width=True)
-
-    with st.expander("ℹ️ 네이버 API 키 발급 & 배포 방법"):
-        st.markdown("""
+with st.expander("ℹ️ 네이버 API 키 발급 & 배포 방법"):
+    st.markdown("""
 **1. 네이버 API 키 발급 (무료, 1회)**
 - developers.naver.com 로그인 → 상단 Application → 애플리케이션 등록
 - 사용 API: **검색** 선택 / 환경: WEB 설정 (URL은 배포 후 Streamlit 주소)
