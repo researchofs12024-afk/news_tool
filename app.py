@@ -458,27 +458,27 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                    "붙여넣은 뒤 빈 줄이 남으면 그 줄에서 Backspace 한 번으로 정리돼요.")
 
         mail_html = st.session_state["mail_html"]
-    # ☆ 수정된 부분: 버튼을 메일 본문과 분리 ☆
-    # 버튼과 메시지를 별도 행에 배치 (고정 위치)
-    btn_col1, btn_col2 = st.columns([4, 1])
+        # ☆ 수정된 부분: 버튼을 메일 본문과 분리 ☆
+        # 버튼과 메시지를 별도 행에 배치 (고정 위치)
+        btn_col1, btn_col2 = st.columns([4, 1])
 
-    with btn_col1:
-        copy_btn = st.button(
-            "📋 메일 본문 복사 (서식 유지)",
-            use_container_width=True,
-            key="copy_mail_btn"
-        )
+        with btn_col1:
+            copy_btn = st.button(
+                "📋 메일 본문 복사 (서식 유지)",
+                use_container_width=True,
+                key="copy_mail_btn"
+            )
 
-    msg_placeholder = btn_col2.empty()
+        msg_placeholder = btn_col2.empty()
 
-    if copy_btn:
-        st.session_state["copy_success"] = True
-        msg_placeholder.success("✓ 복사됨!")
+        if copy_btn:
+            st.session_state["copy_success"] = True
+            msg_placeholder.success("✓ 복사됨!")
 
-    st.divider()  # 분리선 추가
+        st.divider()  # 분리선 추가
 
-    # 메일 본문 미리보기만 렌더링 (스크롤 가능)
-    st.components.v1.html(preview_html, height=500, scrolling=True)
+        # 메일 본문 미리보기만 렌더링 (스크롤 가능)
+        st.components.v1.html(preview_html, height=500, scrolling=True)
 
 
         # 백업용 HTML 파일 다운로드도 유지
