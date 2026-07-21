@@ -26,6 +26,12 @@ try:
 except ImportError:
     trafilatura = None
 
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon="📰", layout="wide")
 
 DEFAULT_KEYWORDS = {
@@ -330,6 +336,20 @@ with st.sidebar:
                               help="낮을수록 더 많이 제거 (0.5 기본, 0.4 적극 제거)")
 
     st.divider()
+    st.write("**AI 요약 설정 (선택사항)**")
+
+    # Streamlit Secrets에서 API 키 읽기
+    gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+
+    if gemini_key:
+        use_gemini = st.checkbox("Google Gemini AI로 요약", value=True,
+                                help="✓ API 키 설정됨")
+        st.caption("✓ Gemini API 준비 완료")
+    else:
+        use_gemini = False
+        st.warning("⚠️ GEMINI_API_KEY가 설정되지 않았습니다.\n`.streamlit/secrets.toml`에 키를 추가하세요.")
+
+    st.divider()
     st.write("**카테고리 선택**")
     selected = {c: st.checkbox(c, value=True) for c in DEFAULT_KEYWORDS}
 
@@ -439,6 +459,30 @@ def suggest_category(keyword: str, title: str) -> str:
         if any(w in text for w in words):
             return cat
     return "업계동향"
+
+def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
+    """
+    Gemini API를 사용해서 기사 텍스트를 한 문장으로 요약
+    """
+    if not GEMINI_AVAILABLE or not gemini_key:
+        return ""
+
+    try:
+        genai.configure(api_key=gemini_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        response = model.generate_content(
+            f"다음 뉴스 기사를 한 문장 (최대 100글자)으로 정확하게 요약해줘:\n\n{article_text[:1000]}"
+        )
+
+        summary = response.text.strip()
+        if summary:
+            return summary[:150]
+        return ""
+
+    except Exception:
+        return ""
+
 
 def extract_article_summary(url: str, max_chars: int = 150) -> str:
     """
@@ -605,20 +649,15 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
     if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
                  disabled=sel.empty):
-        # 원문 크롤링으로 요약 생성
-        st.write("**디버깅 정보:**")
 
-        if NEWSPAPER_AVAILABLE:
-            st.write("✓ newspaper3k 설치됨 (한국 뉴스 최적)")
-        if trafilatura:
-            st.write("✓ trafilatura 설치됨 (폴백)")
+        use_ai = use_gemini and gemini_key
 
-        if not NEWSPAPER_AVAILABLE and not trafilatura:
-            st.warning("⚠️ 크롤링 라이브러리가 설치되지 않았습니다.\n다음 중 하나 실행 후 재시작:\n`pip install newspaper3k` 또는 `pip install trafilatura`")
-            st.stop()
+        if use_ai:
+            st.write("**AI 요약 설정:**")
+            st.write("✓ Google Gemini API 활성화")
 
-        with st.spinner("기사 본문에서 요약 추출 중..."):
-            prog = st.progress(0, text="크롤링 중... (0/0)")
+        with st.spinner("기사 본문 크롤링 및 요약 생성 중..."):
+            prog = st.progress(0, text="처리 중... (0/0)")
             updated_count = 0
             failed_urls = []
 
@@ -628,28 +667,46 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             for idx, row in sel_copy.iterrows():
                 prog.progress(
                     (idx + 1) / len(sel_copy),
-                    text=f"크롤링 중... ({idx + 1}/{len(sel_copy)})"
+                    text=f"처리 중... ({idx + 1}/{len(sel_copy)})"
                 )
                 url = row.get("링크", "")
                 if url:
-                    # 모든 기사에서 크롤링으로 요약 생성
-                    summary = extract_article_summary(url)
-                    if summary:
-                        sel_copy.loc[idx, "요약"] = summary
-                        updated_count += 1
+                    if use_ai:
+                        # 방법 1: Gemini AI로 요약 (크롤링 + AI)
+                        try:
+                            article = Article(url, language='ko')
+                            article.download(timeout=8)
+                            article.parse()
+                            article_text = article.text
+
+                            if article_text and len(article_text.strip()) >= 50:
+                                summary = generate_summary_with_gemini(article_text, gemini_key)
+                                if summary:
+                                    sel_copy.loc[idx, "요약"] = summary
+                                    updated_count += 1
+                                else:
+                                    failed_urls.append(url[:50])
+                            else:
+                                failed_urls.append(url[:50])
+                        except Exception:
+                            failed_urls.append(url[:50])
                     else:
-                        failed_urls.append(url[:50])  # 실패한 URL 기록
-                time.sleep(0.3)  # 서버 부하 방지
+                        # 방법 2: 기존 방식 (자동 크롤링)
+                        summary = extract_article_summary(url)
+                        if summary:
+                            sel_copy.loc[idx, "요약"] = summary
+                            updated_count += 1
+                        else:
+                            failed_urls.append(url[:50])
+
+                time.sleep(0.2)  # 서버 부하 방지
 
             prog.empty()
 
             # 결과 표시
-            st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 기사 요약 업데이트")
+            st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 기사 요약 완료")
             if failed_urls:
-                st.warning(f"⚠️ {len(failed_urls)}개 기사는 크롤링 실패 (웹사이트 차단 또는 구조 차이)")
-                with st.expander("실패한 URL 확인"):
-                    for url in failed_urls[:5]:  # 처음 5개만
-                        st.text(url)
+                st.info(f"ℹ️ {len(failed_urls)}개 기사는 요약 실패 (링크 접근 불가 등)")
 
             sel = sel_copy
 
