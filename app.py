@@ -468,7 +468,8 @@ def suggest_category(keyword: str, title: str) -> str:
 
 def extract_text_with_bs4(url: str) -> str:
     """
-    BeautifulSoup으로 HTML에서 텍스트 추출 (한국 뉴스 최적화)
+    BeautifulSoup으로 HTML에서 본문 텍스트만 추출 (한국 뉴스 최적화)
+    메뉴, 광고, 카테고리 등 제거
     """
     if not BS_AVAILABLE:
         return ""
@@ -482,14 +483,29 @@ def extract_text_with_bs4(url: str) -> str:
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # 스크립트, 스타일 제거
-        for script in soup(["script", "style"]):
-            script.decompose()
+        # 스크립트, 스타일, 네비게이션, 광고 제거
+        for selector in ['script', 'style', 'nav', '.nav', '.menu', '.ad', '.advertisement',
+                         '.comment', '.related', '.sidebar', 'footer']:
+            for element in soup.select(selector):
+                element.decompose()
 
         # 주요 텍스트 컨테이너 찾기 (한국 뉴스사이트)
         article_body = None
-        for selector in ['article', '.article-body', '.news-body', '#article-view-content-div',
-                         '.article_content', '.content', 'main']:
+        selectors = [
+            'article',
+            '.article-body',
+            '.news-body',
+            '#article-view-content-div',
+            '.article_content',
+            '.article-content',
+            '.articleText',
+            '.news-content',
+            '.entry-content',
+            '.post-content',
+            'main'
+        ]
+
+        for selector in selectors:
             article_body = soup.select_one(selector)
             if article_body:
                 break
@@ -497,11 +513,29 @@ def extract_text_with_bs4(url: str) -> str:
         if article_body:
             text = article_body.get_text()
         else:
-            text = soup.get_text()
+            # 폴백: 가장 큰 텍스트 블록 찾기
+            paragraphs = soup.find_all(['p', 'div'], class_=re.compile(r'(article|content|body|text)', re.I))
+            if paragraphs:
+                text = ' '.join([p.get_text() for p in paragraphs[:10]])
+            else:
+                text = soup.get_text()
+
+        # 공백 정리 및 중복 제거
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+        # 너무 짧은 줄 제거 (메뉴, 카테고리 등)
+        lines = [line for line in lines if len(line) > 10]
+
+        text = ' '.join(lines)
 
         # 공백 정리
         text = re.sub(r'\s+', ' ', text).strip()
-        return text[:2000]  # 처음 2000글자만
+
+        # 너무 짧으면 빈 문자열 반환
+        if len(text) < 100:
+            return ""
+
+        return text[:2500]  # 처음 2500글자
 
     except Exception:
         return ""
@@ -519,7 +553,17 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
         model = genai.GenerativeModel('gemini-1.5-flash')
 
         response = model.generate_content(
-            f"다음 부동산 뉴스를 명사형으로 끝나는 뉴스 헤드라인 스타일의 한 문장 (최대 100글자)으로 요약해줘. 예: '기업명, 핵심내용 추진' 형태:\n\n{article_text[:1500]}"
+            f"""다음 뉴스 기사의 핵심을 명사형으로 끝나는 한 줄 헤드라인 (최대 100글자)으로 요약해줘.
+
+요구사항:
+- 명사형 어조로 끝낼 것 (예: '~추진', '~확정', '~결정', '~완료' 등)
+- 주체(회사/기관명)와 핵심 내용을 명확히 포함
+- 숫자나 수치는 간결하게
+
+기사 내용:
+{article_text[:2000]}
+
+헤드라인:"""
         )
 
         summary = response.text.strip()
