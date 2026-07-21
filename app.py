@@ -32,6 +32,12 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
+try:
+    from bs4 import BeautifulSoup
+    BS_AVAILABLE = True
+except ImportError:
+    BS_AVAILABLE = False
+
 st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon="📰", layout="wide")
 
 DEFAULT_KEYWORDS = {
@@ -460,11 +466,52 @@ def suggest_category(keyword: str, title: str) -> str:
             return cat
     return "업계동향"
 
+def extract_text_with_bs4(url: str) -> str:
+    """
+    BeautifulSoup으로 HTML에서 텍스트 추출 (한국 뉴스 최적화)
+    """
+    if not BS_AVAILABLE:
+        return ""
+
+    try:
+        response = requests.get(url, timeout=8, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'
+        })
+        if response.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # 스크립트, 스타일 제거
+        for script in soup(["script", "style"]):
+            script.decompose()
+
+        # 주요 텍스트 컨테이너 찾기 (한국 뉴스사이트)
+        article_body = None
+        for selector in ['article', '.article-body', '.news-body', '#article-view-content-div',
+                         '.article_content', '.content', 'main']:
+            article_body = soup.select_one(selector)
+            if article_body:
+                break
+
+        if article_body:
+            text = article_body.get_text()
+        else:
+            text = soup.get_text()
+
+        # 공백 정리
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text[:2000]  # 처음 2000글자만
+
+    except Exception:
+        return ""
+
+
 def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
     """
     Gemini API를 사용해서 기사 텍스트를 한 문장으로 요약
     """
-    if not GEMINI_AVAILABLE or not gemini_key:
+    if not GEMINI_AVAILABLE or not gemini_key or not article_text:
         return ""
 
     try:
@@ -472,11 +519,11 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
         model = genai.GenerativeModel('gemini-1.5-flash')
 
         response = model.generate_content(
-            f"다음 뉴스 기사를 한 문장 (최대 100글자)으로 정확하게 요약해줘:\n\n{article_text[:1000]}"
+            f"다음 뉴스 기사를 한 문장 (최대 100글자)으로 정확하게 요약해줘:\n\n{article_text[:1500]}"
         )
 
         summary = response.text.strip()
-        if summary:
+        if summary and len(summary) > 10:
             return summary[:150]
         return ""
 
@@ -671,27 +718,39 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 )
                 url = row.get("링크", "")
                 if url:
-                    if use_ai:
-                        # 방법 1: Gemini AI로 요약 (크롤링 + AI)
-                        try:
-                            article = Article(url, language='ko')
-                            article.download(timeout=8)
-                            article.parse()
-                            article_text = article.text
+                    article_text = None
 
-                            if article_text and len(article_text.strip()) >= 50:
-                                summary = generate_summary_with_gemini(article_text, gemini_key)
-                                if summary:
-                                    sel_copy.loc[idx, "요약"] = summary
-                                    updated_count += 1
-                                else:
-                                    failed_urls.append(url[:50])
+                    if use_ai:
+                        # Gemini AI 요약 (크롤링 + AI)
+                        # 1순위: BeautifulSoup (한국 뉴스 최적)
+                        article_text = extract_text_with_bs4(url)
+
+                        # 2순위: newspaper3k (폴백)
+                        if not article_text or len(article_text.strip()) < 50:
+                            try:
+                                article = Article(url, language='ko')
+                                article.download(timeout=8)
+                                article.parse()
+                                article_text = article.text
+                            except Exception:
+                                article_text = None
+
+                        # 3순위: trafilatura (마지막 폴백)
+                        if not article_text or len(article_text.strip()) < 50:
+                            article_text = extract_article_summary(url)
+
+                        # Gemini로 요약
+                        if article_text and len(article_text.strip()) >= 50:
+                            summary = generate_summary_with_gemini(article_text, gemini_key)
+                            if summary:
+                                sel_copy.loc[idx, "요약"] = summary
+                                updated_count += 1
                             else:
                                 failed_urls.append(url[:50])
-                        except Exception:
+                        else:
                             failed_urls.append(url[:50])
                     else:
-                        # 방법 2: 기존 방식 (자동 크롤링)
+                        # 기존 방식 (자동 크롤링)
                         summary = extract_article_summary(url)
                         if summary:
                             sel_copy.loc[idx, "요약"] = summary
