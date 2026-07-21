@@ -492,7 +492,18 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             lambda r: suggest_category(str(r.get("키워드", "")), str(r.get("제목", ""))), axis=1)
         edit["언론사"] = edit["언론사"].fillna("").apply(
             lambda s: s if str(s).strip() else PRESS_PLACEHOLDER)
-        edit["요약"] = edit["요약초안"].fillna("").apply(lambda s: s[:120])
+
+        # 요약: 첫 문장 또는 60글자 (간결하게)
+        def get_summary(text):
+            if not text:
+                return ""
+            # 첫 마침표까지만 추출 (없으면 60글자)
+            match = re.search(r'[^.!?\n]*[.!?]', text)
+            if match:
+                return match.group(0)[:70]
+            return text[:70]
+
+        edit["요약"] = edit["요약초안"].fillna("").apply(get_summary)
         st.session_state["editor_df"] = edit
 
     edited = st.data_editor(
@@ -587,35 +598,3 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
             file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
             mime="text/html", use_container_width=True)
-
-with st.expander("ℹ️ 네이버 API 키 발급 & 배포 방법"):
-    st.markdown("""
-**1. 네이버 API 키 발급 (무료, 1회)**
-- developers.naver.com 로그인 → 상단 Application → 애플리케이션 등록
-- 사용 API: **검색** 선택 / 환경: WEB 설정
-- 발급된 **Client ID / Client Secret** 확보 (하루 25,000회 무료)
-
-**2. Streamlit Cloud 배포**
-- GitHub에 이 파일 + requirements.txt 업로드 → share.streamlit.io에서 Deploy
-- 키를 매번 입력하기 싫으면 앱 Settings → **Secrets**에 아래 저장:
-```
-NAVER_CLIENT_ID = "발급받은_ID"
-NAVER_CLIENT_SECRET = "발급받은_SECRET"
-```
-
-**3. requirements.txt**
-```
-streamlit>=1.28
-requests
-feedparser
-pandas
-openpyxl
-```
-
-**개선사항**
-- ✅ 제목 유사도 기반 중복 제거 (SequenceMatcher)
-- ✅ 단어 유사도 추가 필터링 (자카드)
-- ✅ 링크 중복 제거
-- ✅ 유사도 임계값 조절 가능 (사이드바)
-- ✅ 같은 내용 다른 제목 자동 필터
-""")
