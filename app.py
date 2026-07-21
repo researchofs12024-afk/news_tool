@@ -54,14 +54,16 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
         params = {"query": keyword, "display": 100, "start": start, "sort": "date"}
         try:
             r = requests.get("https://openapi.naver.com/v1/search/news.json",
-                             headers=headers, params=params, timeout=10)
+                             headers=headers, params=params, timeout=20)
             if diag is not None:
                 diag["status"] = r.status_code
             if r.status_code != 200:
                 return rows, f"네이버 API 오류 {r.status_code}: {r.text[:150]}"
             items = r.json().get("items", [])
+        except requests.exceptions.Timeout:
+            return rows, f"네이버 API 타임아웃 (키워드: {keyword})"
         except Exception as e:
-            return rows, f"네이버 요청 실패: {e}"
+            return rows, f"네이버 요청 실패 ({keyword}): {str(e)[:100]}"
 
         if not items:
             break
@@ -92,7 +94,7 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
             })
         if stop:
             break
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     if diag is not None:
         diag["raw_count"] = raw_count
@@ -138,16 +140,26 @@ def press_from_link(url: str) -> str:
 
 # ── 구글 뉴스 RSS ────────────────────────────────────────────
 def fetch_google(keyword, category, within_days, hours_limit):
+    """구글 뉴스 RSS 파싱 (타임아웃 및 에러 처리 강화)"""
     q = urllib.parse.quote(f"{keyword} when:{within_days}d")
     url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
-    feed = feedparser.parse(url)
-    now = dt.datetime.now(KST)
     rows = []
+    now = dt.datetime.now(KST)
+
+    try:
+        feed = feedparser.parse(url, timeout=15)
+        if feed.status != 200 and not feed.entries:
+            return rows
+    except Exception:
+        return rows
 
     for e in feed.entries:
         pub = None
         if getattr(e, "published_parsed", None):
-            pub = dt.datetime(*e.published_parsed[:6], tzinfo=dt.timezone.utc).astimezone(KST)
+            try:
+                pub = dt.datetime(*e.published_parsed[:6], tzinfo=dt.timezone.utc).astimezone(KST)
+            except Exception:
+                pass
 
         if hours_limit and pub and (now - pub).total_seconds() > hours_limit * 3600:
             continue
@@ -188,12 +200,13 @@ def calculate_word_similarity(title1: str, title2: str) -> float:
     union = len(words1 | words2)
     return intersection / union if union > 0 else 0.0
 
-def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5):
+def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5, progress_bar=None):
     """
-    강화된 중복 제거 (유사도 기반)
+    강화된 중복 제거 (유사도 기반 + 최적화)
     - 제목 유사도 > title_sim_threshold OR 단어 유사도 > word_sim_threshold → 중복 판정
     - 네이버 우선 유지
     - 최신순 정렬
+    - 빠른 사전 체크: 길이 차이, 첫 글자 등으로 명백한 비중복 판정 후 유사도 계산
     """
     if df.empty:
         return df
@@ -208,28 +221,54 @@ def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5):
     df = df.sort_values(["_p", "발행시각"], ascending=[False, False])
 
     keep_rows = []
+    total = len(df)
 
     for idx, row in df.iterrows():
         title = row["제목"]
+        title_len = len(title)
         is_dup = False
 
         # 이미 선택된 기사들과 비교
         for kept_row in keep_rows:
             kept_title = kept_row["제목"]
+            kept_len = len(kept_title)
 
-            # 제목 문자열 유사도
+            # 빠른 사전 체크: 길이 차이가 60% 이상 차이나면 비중복
+            # (예: 50글자 vs 30글자 → 다른 기사일 가능성 높음)
+            if max(title_len, kept_len) > 0:
+                len_ratio = min(title_len, kept_len) / max(title_len, kept_len)
+                if len_ratio < 0.4:  # 너무 길이 다르면 skip
+                    continue
+
+            # 첫 글자 10글자가 완전히 다르면 skip (명백한 다른 기사)
+            title_prefix = title[:10]
+            kept_prefix = kept_title[:10]
+            if len(set(title_prefix) & set(kept_prefix)) < 2:
+                continue
+
+            # 이제 비용 큰 유사도 계산
             seq_sim = calculate_title_similarity(title, kept_title)
 
-            # 단어 기반 유사도
-            word_sim = calculate_word_similarity(title, kept_title)
+            # 문자열 유사도 낮으면 단어 유사도도 계산하지 않음
+            if seq_sim > title_sim_threshold:
+                is_dup = True
+                break
 
-            # 두 유사도 중 하나라도 임계값 초과 → 중복
-            if seq_sim > title_sim_threshold or word_sim > word_sim_threshold:
+            # 문자열 유사도 낮으면 단어 유사도만 확인
+            word_sim = calculate_word_similarity(title, kept_title)
+            if word_sim > word_sim_threshold:
                 is_dup = True
                 break
 
         if not is_dup:
             keep_rows.append(row)
+
+        # 진행률 표시
+        if progress_bar is not None:
+            progress_bar.progress(
+                (idx + 1) / total,
+                text=f"중복 제거 중... ({idx + 1}/{total})"
+            )
 
     result_df = pd.DataFrame(keep_rows).reset_index(drop=True)
     result_df = result_df.drop(columns=["_p"], errors="ignore")
@@ -337,8 +376,14 @@ if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=Tr
                 "kept": "24h내채택", "newest": "최신기사시각"})
             st.dataframe(dd, hide_index=True, use_container_width=True)
 
-    # 중복 제거 실행
-    df = dedup(pd.DataFrame(all_rows), title_sim_threshold=sim_threshold, word_sim_threshold=0.5)
+    # 중복 제거 실행 (진행률 표시)
+    if all_rows:
+        dedup_prog = st.progress(0.0, text="중복 제거 중... (0/0)")
+        df = dedup(pd.DataFrame(all_rows), title_sim_threshold=sim_threshold,
+                   word_sim_threshold=0.5, progress_bar=dedup_prog)
+        dedup_prog.empty()
+    else:
+        df = pd.DataFrame()
 
     if df.empty:
         st.warning("수집된 기사가 없습니다.")
