@@ -509,7 +509,7 @@ def extract_text_with_bs4(url: str) -> str:
 
 def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
     """
-    Gemini API를 사용해서 기사 텍스트를 한 문장으로 요약
+    Gemini API로 객관적 헤드라인톤 요약 생성
     """
     if not GEMINI_AVAILABLE or not gemini_key or not article_text:
         return ""
@@ -519,7 +519,7 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
         model = genai.GenerativeModel('gemini-1.5-flash')
 
         response = model.generate_content(
-            f"다음 뉴스 기사를 한 문장 (최대 100글자)으로 정확하게 요약해줘:\n\n{article_text[:1500]}"
+            f"다음 부동산 뉴스를 뉴스 헤드라인 스타일의 객관적인 한 문장 (최대 100글자)으로 요약해줘:\n\n{article_text[:1500]}"
         )
 
         summary = response.text.strip()
