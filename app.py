@@ -580,13 +580,18 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
                  disabled=sel.empty):
         # 원문 크롤링으로 요약 생성
+        st.write("**디버깅 정보:**")
+
         if not trafilatura:
             st.warning("⚠️ trafilatura 라이브러리가 설치되지 않았습니다. pip install trafilatura 실행 후 재시작하세요.")
             st.stop()
+        else:
+            st.write("✓ trafilatura 설치됨")
 
         with st.spinner("기사 본문에서 요약 추출 중..."):
             prog = st.progress(0, text="크롤링 중... (0/0)")
             updated_count = 0
+            failed_urls = []
 
             # sel을 copy해서 인덱스 리셋
             sel_copy = sel.copy().reset_index(drop=True)
@@ -598,15 +603,24 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 )
                 url = row.get("링크", "")
                 if url:
-                    # 모든 기사에서 크롤링으로 요약 생성 (기존 요약 덮어쓰기)
+                    # 모든 기사에서 크롤링으로 요약 생성
                     summary = extract_article_summary(url)
                     if summary:
                         sel_copy.loc[idx, "요약"] = summary
                         updated_count += 1
+                    else:
+                        failed_urls.append(url[:50])  # 실패한 URL 기록
                 time.sleep(0.3)  # 서버 부하 방지
 
             prog.empty()
-            st.info(f"✓ {updated_count}/{len(sel_copy)}개 기사 요약 업데이트 완료")
+
+            # 결과 표시
+            st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 기사 요약 업데이트")
+            if failed_urls:
+                st.warning(f"⚠️ {len(failed_urls)}개 기사는 크롤링 실패 (웹사이트 차단 또는 구조 차이)")
+                with st.expander("실패한 URL 확인"):
+                    for url in failed_urls[:5]:  # 처음 5개만
+                        st.text(url)
 
             sel = sel_copy
 
