@@ -1,16 +1,14 @@
 """
-상업용 부동산 뉴스 클리핑 v3.1 (강화된 중복 제거 + Gemini 재시도)
+상업용 부동산 뉴스 클리핑 v3 (강화된 중복 제거)
 네이버 뉴스 API + 구글 뉴스 RSS 통합 + 유사도 기반 중복 제거
 """
 import io
 import re
 import time
 import html
-import json
 import datetime as dt
 import urllib.parse
 from difflib import SequenceMatcher
-
 import requests
 import feedparser
 import pandas as pd
@@ -28,7 +26,7 @@ try:
 except ImportError:
     trafilatura = None
 
-# Gemini는 SDK 대신 REST API 직접 호출 (신형 키 호환)
+# Gemini는 SDK 대신 REST API 직접 호출 (AQ. 신형 키 호환)
 GEMINI_AVAILABLE = True
 
 try:
@@ -41,13 +39,9 @@ st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon=
 
 DEFAULT_KEYWORDS = {
     "기존 키워드": [
-        "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권",
-        "물류센터 매매", "물류센터 공실", "오피스 이전 -영화", "매각주관사 빌딩",
-        "사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발",
-        "오피스 매입", "사옥 이전", "사옥 신축", "사무실 이전",
-        "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양", "오피스 펀드",
-        "오피스 리츠", "공유 오피스", "물류센터 부동산", "데이터센터 개발",
-        "데이터센터 투자", "증권 부동산 투자 해외 -분양", "보험업"
+        "자산운용 매각", "자산운용 매입", "복합개발 -분양", "리테일 상권", "물류센터 매매", "물류센터 공실", "오피스 이전 -영화",
+        "매각주관사 빌딩","사옥 매각", "리츠 건물", "오피스 복합개발", "부동산 복합개발", "오피스 매입", "사옥 이전", "사옥 신축", "사무실 이전", "물류센터 매각", "물류센터 투자", "증권 부동산 투자 -분양",
+        "오피스 펀드", "오피스 리츠", "공유 오피스", "물류센터 부동산", "데이터센터 개발", "데이터센터 투자", "증권 부동산 투자 해외 -분양", "보험업"
     ],
     "신규 키워드": [
     ],
@@ -56,7 +50,6 @@ DEFAULT_KEYWORDS = {
 KST = dt.timezone(dt.timedelta(hours=9))
 PRESS_PLACEHOLDER = "(언론사 기입 필요)"
 
-
 def clean(text: str) -> str:
     """HTML 태그·엔티티 제거 후 공백 정리."""
     if not text:
@@ -64,7 +57,6 @@ def clean(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
-
 
 # ── 네이버 뉴스 검색 API ──────────────────────────────────────
 def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag=None):
@@ -95,8 +87,8 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
 
         if not items:
             break
-        raw_count += len(items)
 
+        raw_count += len(items)
         stop = False
         for it in items:
             pub = None
@@ -112,8 +104,7 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
                 break
 
             rows.append({
-                "카테고리": category,
-                "키워드": keyword,
+                "카테고리": category, "키워드": keyword,
                 "제목": clean(it.get("title", "")),
                 "언론사": press_from_link(it.get("originallink") or it.get("link", "")),
                 "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
@@ -121,7 +112,6 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
                 "요약초안": clean(it.get("description", "")),
                 "출처": "네이버",
             })
-
         if stop:
             break
         time.sleep(0.05)
@@ -130,8 +120,8 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
         diag["raw_count"] = raw_count
         diag["newest"] = newest_pub.strftime("%Y-%m-%d %H:%M") if newest_pub else "없음"
         diag["kept"] = len(rows)
-    return rows, None
 
+    return rows, None
 
 # 링크 도메인 → 언론사명 매핑
 PRESS_DOMAIN_MAP = {
@@ -145,13 +135,12 @@ PRESS_DOMAIN_MAP = {
     "yna.co.kr": "연합뉴스", "yonhapnews.co.kr": "연합뉴스", "news1.kr": "뉴스1",
     "heraldcorp.com": "헤럴드경제", "etnews.com": "전자신문", "dt.co.kr": "디지털타임스",
     "thebell.co.kr": "더벨", "investchosun.com": "인베스트조선", "dealsite.co.kr": "딜사이트",
-    "businesspost.co.kr": "비즈니스포스트", "bizhankook.com": "비즈한국", "wowtv.co.kr": "한국경제TV",
-    "moneys.co.kr": "머니S", "ceoscoredaily.com": "CEO스코어데일리",
+    "businesspost.co.kr": "비즈니스포스트", "bizhankook.com": "비즈한국",
+    "wowtv.co.kr": "한국경제TV", "moneys.co.kr": "머니S", "ceoscoredaily.com": "CEO스코어데일리",
     "housingnews.co.kr": "하우징헤럴드", "r-e.kr": "부동산일보", "kukinews.com": "쿠키뉴스",
     "newspim.com": "뉴스핌", "ebn.co.kr": "EBN", "ibabo.co.kr": "이바보",
     "tfmedia.co.kr": "조세금융신문", "g-enews.com": "글로벌이코노믹",
 }
-
 
 def press_from_link(url: str) -> str:
     """기사 링크 도메인에서 언론사명 유추"""
@@ -169,7 +158,6 @@ def press_from_link(url: str) -> str:
         pass
     return PRESS_PLACEHOLDER
 
-
 # ── 구글 뉴스 RSS ────────────────────────────────────────────
 def fetch_google(keyword, category, within_days, hours_limit):
     """구글 뉴스 RSS 파싱 (타임아웃 및 에러 처리 강화)"""
@@ -179,8 +167,8 @@ def fetch_google(keyword, category, within_days, hours_limit):
     now = dt.datetime.now(KST)
 
     try:
-        feed = feedparser.parse(url)
-        if getattr(feed, "status", 200) != 200 and not feed.entries:
+        feed = feedparser.parse(url, timeout=15)
+        if feed.status != 200 and not feed.entries:
             return rows
     except Exception:
         return rows
@@ -205,47 +193,50 @@ def fetch_google(keyword, category, within_days, hours_limit):
             source = press_from_link(e.link)
 
         rows.append({
-            "카테고리": category,
-            "키워드": keyword,
-            "제목": title.strip(),
-            "언론사": source,
+            "카테고리": category, "키워드": keyword,
+            "제목": title.strip(), "언론사": source,
             "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
             "링크": e.link,
             "요약초안": clean(e.get("summary", "")) if e.get("summary") else "",
             "출처": "구글",
         })
-    return rows
 
+    return rows
 
 # ── 개선된 중복 제거 (유사도 기반) ───────────────────────────────
 def calculate_title_similarity(title1: str, title2: str) -> float:
     """제목 간 유사도 계산 (0~1, 1=동일)"""
     return SequenceMatcher(None, title1, title2).ratio()
 
-
 def calculate_word_similarity(title1: str, title2: str) -> float:
     """제목의 공통 단어 비율 (자카드 유사도)"""
     words1 = set(title1.split())
     words2 = set(title2.split())
+
     if not words1 or not words2:
         return 0.0
+
     intersection = len(words1 & words2)
     union = len(words1 | words2)
     return intersection / union if union > 0 else 0.0
-
 
 def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5, progress_bar=None):
     """
     강화된 중복 제거 (유사도 기반 + 최적화)
     - 제목 유사도 > title_sim_threshold OR 단어 유사도 > word_sim_threshold → 중복 판정
-    - 네이버 우선 유지, 최신순 정렬
+    - 네이버 우선 유지
+    - 최신순 정렬
+    - 빠른 사전 체크: 길이 차이, 첫 글자 등으로 명백한 비중복 판정 후 유사도 계산
     """
     if df.empty:
         return df
 
     df = df.copy()
+
+    # 링크 중복 제거 (같은 URL이면 당연히 같은 기사)
     df = df.drop_duplicates(subset=["링크"], keep="first")
 
+    # 네이버 우선, 최신순 정렬
     df["_p"] = (df["출처"] == "네이버").astype(int)
     df = df.sort_values(["_p", "발행시각"], ascending=[False, False]).reset_index(drop=True)
 
@@ -257,25 +248,33 @@ def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5, progress_bar=Non
         title_len = len(title)
         is_dup = False
 
+        # 이미 선택된 기사들과 비교
         for kept_row in keep_rows:
             kept_title = kept_row["제목"]
             kept_len = len(kept_title)
 
+            # 빠른 사전 체크: 길이 차이가 60% 이상 차이나면 비중복
+            # (예: 50글자 vs 30글자 → 다른 기사일 가능성 높음)
             if max(title_len, kept_len) > 0:
                 len_ratio = min(title_len, kept_len) / max(title_len, kept_len)
-                if len_ratio < 0.4:
+                if len_ratio < 0.4:  # 너무 길이 다르면 skip
                     continue
 
+            # 첫 글자 10글자가 완전히 다르면 skip (명백한 다른 기사)
             title_prefix = title[:10]
             kept_prefix = kept_title[:10]
             if len(set(title_prefix) & set(kept_prefix)) < 2:
                 continue
 
+            # 이제 비용 큰 유사도 계산
             seq_sim = calculate_title_similarity(title, kept_title)
+
+            # 문자열 유사도 낮으면 단어 유사도도 계산하지 않음
             if seq_sim > title_sim_threshold:
                 is_dup = True
                 break
 
+            # 문자열 유사도 낮으면 단어 유사도만 확인
             word_sim = calculate_word_similarity(title, kept_title)
             if word_sim > word_sim_threshold:
                 is_dup = True
@@ -284,14 +283,17 @@ def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5, progress_bar=Non
         if not is_dup:
             keep_rows.append(row)
 
+        # 진행률 표시 (current_idx 사용 - 0부터 시작)
         if progress_bar is not None and total > 0:
-            progress = min((current_idx + 1) / total, 1.0)
-            progress_bar.progress(progress, text=f"중복 제거 중... ({current_idx + 1}/{total})")
+            progress = min((current_idx + 1) / total, 1.0)  # 1.0 초과 방지
+            progress_bar.progress(
+                progress,
+                text=f"중복 제거 중... ({current_idx + 1}/{total})"
+            )
 
     result_df = pd.DataFrame(keep_rows).reset_index(drop=True)
     result_df = result_df.drop(columns=["_p"], errors="ignore")
     return result_df
-
 
 def to_excel_bytes(df):
     """Excel 다운로드 바이트 생성"""
@@ -309,7 +311,6 @@ def to_excel_bytes(df):
                 c.style = "Hyperlink"
     return buf.getvalue()
 
-
 # ── UI ───────────────────────────────────────────────────────
 st.title("📰 상업용 부동산 뉴스 클리핑")
 st.caption("네이버 뉴스 API + 구글 뉴스 RSS 통합 · 강화된 중복 제거 · 최근 24시간")
@@ -318,7 +319,6 @@ with st.sidebar:
     st.header("⚙️ 설정")
     use_naver = st.checkbox("네이버 API 사용", value=True)
     use_google = st.checkbox("구글 RSS 사용", value=True)
-
     cid = csecret = ""
     if use_naver:
         try:
@@ -334,109 +334,112 @@ with st.sidebar:
     strict24 = st.checkbox("정확히 24시간 이내만", value=True)
 
     st.divider()
-    st.write("중복 제거 민감도")
+    st.write("**중복 제거 민감도**")
     sim_threshold = st.slider("제목 유사도 임계값", 0.4, 0.6, 0.5, 0.05,
                               help="낮을수록 더 많이 제거 (0.5 기본, 0.4 적극 제거)")
 
     st.divider()
-    st.write("AI 요약 설정 (선택사항)")
-    gemini_key = ""
-    try:
-        gemini_key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:
-        gemini_key = ""
+    st.write("**AI 요약 설정 (선택사항)**")
+
+    # Streamlit Secrets에서 API 키 읽기
+    gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+
     if gemini_key:
-        use_gemini = st.checkbox("Google Gemini AI로 요약", value=True, help="✓ API 키 설정됨")
+        use_gemini = st.checkbox("Google Gemini AI로 요약", value=True,
+                                help="✓ API 키 설정됨")
         st.caption("✓ Gemini 준비 완료 (REST API 직접 호출)")
     else:
         use_gemini = False
         st.warning("⚠️ GEMINI_API_KEY가 설정되지 않았습니다.\n앱 Settings → Secrets에 키를 추가하세요.")
 
     st.divider()
-    st.write("카테고리 선택")
+    st.write("**카테고리 선택**")
     selected = {c: st.checkbox(c, value=True) for c in DEFAULT_KEYWORDS}
 
-    st.subheader("키워드 편집")
-    edited = {}
-    cols = st.columns(2)
-    for i, (cat, kws) in enumerate(DEFAULT_KEYWORDS.items()):
-        if selected.get(cat):
-            with cols[i % 2]:
-                txt = st.text_area(cat, value="\n".join(kws), height=110, key=f"kw_{cat}")
-                edited[cat] = [k.strip() for k in txt.splitlines() if k.strip()]
+st.subheader("키워드 편집")
+edited = {}
+cols = st.columns(2)
+for i, (cat, kws) in enumerate(DEFAULT_KEYWORDS.items()):
+    if selected.get(cat):
+        with cols[i % 2]:
+            txt = st.text_area(cat, value="\n".join(kws), height=110, key=f"kw_{cat}")
+            edited[cat] = [k.strip() for k in txt.splitlines() if k.strip()]
 
-    st.divider()
-    if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=True):
-        if use_naver and (not cid or not csecret):
-            st.error("네이버 API를 사용하려면 Client ID/Secret을 입력하세요.")
-            st.stop()
+st.divider()
 
-        hours_limit = 24 if strict24 else None
-        all_rows, errors, diags = [], [], []
-        kw_order = []
-        total = sum(len(v) for v in edited.values())
-        prog = st.progress(0.0, text="수집 중...")
-        done = 0
+if st.button("🔍 뉴스 수집 시작", type="primary", use_container_width=True):
+    if use_naver and (not cid or not csecret):
+        st.error("네이버 API를 사용하려면 Client ID/Secret을 입력하세요.")
+        st.stop()
 
-        for cat, kws in edited.items():
-            for kw in kws:
-                if kw not in kw_order:
-                    kw_order.append(kw)
-                if use_naver:
-                    d = {}
-                    r, err = fetch_naver(kw, cat, cid, csecret, hours_limit, diag=d)
-                    all_rows.extend(r)
-                    d["키워드"] = kw
-                    diags.append(d)
-                    if err:
-                        errors.append(err)
-                if use_google:
-                    all_rows.extend(fetch_google(kw, cat, within, hours_limit))
-                done += 1
-                prog.progress(done / max(total, 1), text=f"수집 중... ({kw})")
-        prog.empty()
+    hours_limit = 24 if strict24 else None
+    all_rows, errors, diags = [], [], []
+    kw_order = []
+    total = sum(len(v) for v in edited.values())
+    prog = st.progress(0.0, text="수집 중...")
+    done = 0
 
-        if errors:
-            st.error("네이버 API 오류:\n\n" + "\n\n".join(set(errors)))
+    for cat, kws in edited.items():
+        for kw in kws:
+            if kw not in kw_order:
+                kw_order.append(kw)
+            if use_naver:
+                d = {}
+                r, err = fetch_naver(kw, cat, cid, csecret, hours_limit, diag=d)
+                all_rows.extend(r)
+                d["키워드"] = kw
+                diags.append(d)
+                if err:
+                    errors.append(err)
+            if use_google:
+                all_rows.extend(fetch_google(kw, cat, within, hours_limit))
+            done += 1
+            prog.progress(done / max(total, 1), text=f"수집 중... ({kw})")
 
-        if use_naver and diags:
-            naver_total = sum(1 for row in all_rows if row.get("출처") == "네이버")
-            with st.expander("🔎 네이버 수집 진단", expanded=(naver_total == 0)):
-                dd = pd.DataFrame(diags)
-                cols_order = [c for c in ["키워드", "status", "raw_count", "kept", "newest"] if c in dd.columns]
-                dd = dd[cols_order].rename(columns={
-                    "status": "HTTP상태", "raw_count": "네이버원본건수",
-                    "kept": "24h내채택", "newest": "최신기사시각"})
-                st.dataframe(dd, hide_index=True, use_container_width=True)
+    prog.empty()
 
-        if all_rows:
-            dedup_prog = st.progress(0.0, text="중복 제거 중... (0/0)")
-            df = dedup(pd.DataFrame(all_rows), title_sim_threshold=sim_threshold,
-                       word_sim_threshold=0.5, progress_bar=dedup_prog)
-            dedup_prog.empty()
-        else:
-            df = pd.DataFrame()
+    if errors:
+        st.error("네이버 API 오류:\n\n" + "\n\n".join(set(errors)))
 
-        if df.empty:
-            st.warning("수집된 기사가 없습니다.")
-            st.session_state.pop("collected", None)
-        else:
-            kw_rank = {kw: i for i, kw in enumerate(kw_order)}
-            df["_kw_rank"] = df["키워드"].map(kw_rank).fillna(len(kw_order)).astype(int)
-            df = df.sort_values(["_kw_rank", "발행시각"], ascending=[True, False])
-            df = df.drop(columns="_kw_rank").reset_index(drop=True)
-            st.session_state["collected"] = df
+    if use_naver and diags:
+        naver_total = sum(1 for row in all_rows if row.get("출처") == "네이버")
+        with st.expander("🔎 네이버 수집 진단", expanded=(naver_total == 0)):
+            dd = pd.DataFrame(diags)
+            cols_order = [c for c in ["키워드", "status", "raw_count", "kept", "newest"] if c in dd.columns]
+            dd = dd[cols_order].rename(columns={
+                "status": "HTTP상태", "raw_count": "네이버원본건수",
+                "kept": "24h내채택", "newest": "최신기사시각"})
+            st.dataframe(dd, hide_index=True, use_container_width=True)
 
-            st.success(f"✅ 총 {len(df)}건 (중복 제거 후) · "
-                       f"네이버 {sum(df['출처']=='네이버')} / 구글 {sum(df['출처']=='구글')}")
-            st.dataframe(df["키워드"].value_counts().rename_axis("키워드").reset_index(name="건수"),
-                         hide_index=True)
+    # 중복 제거 실행 (진행률 표시)
+    if all_rows:
+        dedup_prog = st.progress(0.0, text="중복 제거 중... (0/0)")
+        df = dedup(pd.DataFrame(all_rows), title_sim_threshold=sim_threshold,
+                   word_sim_threshold=0.5, progress_bar=dedup_prog)
+        dedup_prog.empty()
+    else:
+        df = pd.DataFrame()
 
-            fname = f"뉴스클리핑_{dt.datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx"
-            st.download_button("📥 엑셀 다운로드", to_excel_bytes(df), file_name=fname,
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
+    if df.empty:
+        st.warning("수집된 기사가 없습니다.")
+        st.session_state.pop("collected", None)
+    else:
+        kw_rank = {kw: i for i, kw in enumerate(kw_order)}
+        df["_kw_rank"] = df["키워드"].map(kw_rank).fillna(len(kw_order)).astype(int)
+        df = df.sort_values(["_kw_rank", "발행시각"], ascending=[True, False])
+        df = df.drop(columns="_kw_rank").reset_index(drop=True)
+        st.session_state["collected"] = df
 
+        st.success(f"✅ 총 {len(df)}건 (중복 제거 후) · "
+                   f"네이버 {sum(df['출처']=='네이버')} / 구글 {sum(df['출처']=='구글')}")
+
+        st.dataframe(df["키워드"].value_counts().rename_axis("키워드").reset_index(name="건수"),
+                     hide_index=True)
+
+        fname = f"뉴스클리핑_{dt.datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx"
+        st.download_button("📥 엑셀 다운로드", to_excel_bytes(df), file_name=fname,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════
 # 배포 편집 섹션
@@ -444,14 +447,13 @@ with st.sidebar:
 MAIL_CATEGORIES = ["개발계획", "매입매각", "이전동향", "업계동향", "시장동향", "정책"]
 
 CATEGORY_RULES = [
-    ("정책", ["정책", "규제", "법", "제도", "정부", "국토부", "세제", "금리", "완화", "개정"]),
+    ("정책",   ["정책", "규제", "법", "제도", "정부", "국토부", "세제", "금리", "완화", "개정"]),
     ("이전동향", ["이전", "사옥", "본사", "입주", "임차", "리모델링"]),
     ("개발계획", ["개발", "복합개발", "신축", "착공", "준공", "분양", "인허가", "부지"]),
     ("매입매각", ["매각", "매입", "매매", "인수", "거래", "딜", "클로징", "펀드", "리츠", "투자"]),
     ("시장동향", ["시장", "전망", "공실", "임대료", "수익률", "가격", "지수", "동향"]),
     ("업계동향", ["운용", "증권", "보험", "건설", "업계", "협회", "인사", "조직"]),
 ]
-
 
 def suggest_category(keyword: str, title: str) -> str:
     """키워드+제목으로 카테고리 추천"""
@@ -461,43 +463,59 @@ def suggest_category(keyword: str, title: str) -> str:
             return cat
     return "업계동향"
 
-
 def extract_text_with_bs4(url: str) -> str:
-    """BeautifulSoup으로 HTML에서 본문만 추출 (이미지 캡션, 메뉴 제거)"""
+    """
+    BeautifulSoup으로 HTML에서 본문만 추출 (이미지 캡션, 메뉴 제거)
+    """
     if not BS_AVAILABLE:
         return ""
+
     try:
         response = requests.get(url, timeout=8, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'
         })
         if response.status_code != 200:
             return ""
+
         soup = BeautifulSoup(response.content, 'html.parser')
 
+        # 불필요한 요소 제거
         for selector in ['script', 'style', 'nav', 'footer', '.nav', '.menu', '.ad',
                          '.advertisement', '.comment', '.related', '.sidebar', '.social',
                          'figure', '.figure', '.caption', '.photo-caption']:
             for element in soup.select(selector):
                 element.decompose()
 
+        # 본문 컨테이너 찾기
         article_body = None
         selectors = [
-            'article', '#content', '.article-body', '.news-body',
-            '#article-view-content-div', '.article_content', '.article-content',
-            '.articleText', '.news-content', '.entry-content', 'main'
+            'article',
+            '#content',
+            '.article-body',
+            '.news-body',
+            '#article-view-content-div',
+            '.article_content',
+            '.article-content',
+            '.articleText',
+            '.news-content',
+            '.entry-content',
+            'main'
         ]
+
         for selector in selectors:
             article_body = soup.select_one(selector)
             if article_body:
                 break
 
         if article_body:
+            # <p> 태그에서만 텍스트 추출 (본문 문단)
             paragraphs = article_body.find_all('p')
             if paragraphs:
                 text_lines = []
                 for p in paragraphs:
                     p_text = p.get_text().strip()
-                    if not re.match(r'^[▲◀▶★●○□■▼](사진|영상|출처|자료|제공|보도|기자|글)', p_text):
+                    # 이미지 캡션 제거 (▲, 사진=, 영상=, 출처= 등으로 시작)
+                    if not re.match(r'^[▲◀▶★●○□■▼)(사진|영상|출처|자료|제공|보도|기자|글|사진=|영상=|출처=)', p_text):
                         text_lines.append(p_text)
                 text = ' '.join(text_lines)
             else:
@@ -505,22 +523,33 @@ def extract_text_with_bs4(url: str) -> str:
         else:
             text = soup.get_text()
 
+        # 줄 단위 정리
         lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+        # 캡션, 메뉴 패턴 제거
         filtered_lines = []
         for line in lines:
+            # 너무 짧은 줄 제거
             if len(line) < 10:
                 continue
-            if re.match(r'^[▲◀▶★●○□■](사진|영상|출처|자료|제공|보도|기자)', line):
+            # 이미지/영상 캡션 제거
+            if re.match(r'^[▲◀▶★●○□■\()(사진|영상|출처|자료|제공|보도|기자)', line):
                 continue
+            # "방문객들이 ~을 보고 있다" 같은 캡션 제거
             if re.search(r'(둘러보|보며|들이.*보).*있다', line) and len(line) < 50:
                 continue
             filtered_lines.append(line)
+
         text = ' '.join(filtered_lines)
 
+        # 공백 정리
         text = re.sub(r'\s+', ' ', text).strip()
+
         if len(text) < 150:
             return ""
+
         return text[:2500]
+
     except Exception:
         return ""
 
@@ -534,16 +563,24 @@ GEMINI_PROMPT = """뉴스 기사 헤드라인 작성 (명사형 필수)
 4. 최대 100글자
 5. 헤드라인만 출력
 
-기사: {text}
+기사:
+{text}
 
 헤드라인:"""
+
+# 선호 모델 (이 순서로 사용 가능한 것 중 첫 번째 선택). 실제 목록은 API에서 조회.
+GEMINI_PREFERRED = ["flash", "flash-latest", "pro"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_gemini_model(gemini_key: str):
-    """이 키에서 사용 가능한 모델 목록 조회, flash 계열 우선 선택."""
+    """
+    이 키에서 실제 사용 가능한 모델 목록을 조회해 flash 계열을 우선 선택.
+    반환: (모델명 or "", 에러 or None)
+    """
     if not gemini_key:
         return "", "키 없음"
+
     headers = {"x-goog-api-key": gemini_key}
     try:
         r = requests.get(
@@ -552,16 +589,20 @@ def get_gemini_model(gemini_key: str):
         )
         if r.status_code != 200:
             return "", f"모델목록 조회 실패 HTTP {r.status_code}: {r.text[:120]}"
+
         models = r.json().get("models", [])
+        # generateContent 지원 모델만
         usable = []
         for m in models:
             name = m.get("name", "").replace("models/", "")
             methods = m.get("supportedGenerationMethods", [])
             if "generateContent" in methods:
                 usable.append(name)
+
         if not usable:
             return "", "generateContent 지원 모델 없음"
 
+        # flash 계열 우선, gemini 계열 우선
         def score(n):
             s = 0
             if "flash" in n:
@@ -570,24 +611,28 @@ def get_gemini_model(gemini_key: str):
                 s += 5
             if "latest" in n:
                 s += 2
+            # 실험/구버전은 후순위
             if "exp" in n or "1.5" in n or "1.0" in n:
                 s -= 3
             return s
 
         usable.sort(key=score, reverse=True)
         return usable[0], None
+
     except Exception as e:
         return "", f"모델목록 조회 오류: {str(e)[:120]}"
 
 
 def generate_summary_with_gemini(article_text: str, gemini_key: str, model_name: str = ""):
     """
-    Gemini REST API 호출 (503/429 지수 백오프 재시도 강화).
+    Gemini REST API 직접 호출로 명사형 헤드라인 요약 생성.
+    SDK를 거치지 않고 x-goog-api-key 헤더로 키 전달 → AQ. 신형 키 호환.
     반환: (요약문 or "", 에러메시지 or None)
     """
     if not gemini_key or not article_text:
         return "", "키/텍스트 없음"
 
+    # 모델 미지정 시 자동 조회
     if not model_name:
         model_name, err = get_gemini_model(gemini_key)
         if not model_name:
@@ -596,63 +641,57 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, model_name:
     prompt = GEMINI_PROMPT.format(text=article_text[:2500])
     headers = {
         "Content-Type": "application/json",
-        "x-goog-api-key": gemini_key,
+        "x-goog-api-key": gemini_key,  # SDK 우회: 헤더로 직접 전달
     }
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3},
     }
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-
-    # 503(과부하)/429(쿼터)는 최대 3회 재시도 (지수 백오프: 1s, 2s, 4s)
-    last_err = ""
-    for attempt in range(3):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    return "", f"{model_name}: 응답 후보 없음 {str(data)[:100]}"
-                parts = candidates[0].get("content", {}).get("parts", [])
-                summary = "".join(p.get("text", "") for p in parts).strip()
-                if summary and len(summary) > 5:
-                    return summary[:150], None
-                return "", f"{model_name}: 빈 응답"
-            if r.status_code in (503, 429):
-                last_err = f"{model_name} HTTP {r.status_code}(과부하/쿼터)"
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-                    continue
-                return "", f"{last_err} (3회 재시도 실패)"
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        if r.status_code != 200:
             return "", f"{model_name} HTTP {r.status_code}: {r.text[:120]}"
-        except requests.exceptions.Timeout:
-            last_err = f"{model_name}: 타임아웃"
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-                continue
-            return "", f"{last_err} (3회 재시도 실패)"
-        except Exception as e:
-            return "", f"{model_name}: {str(e)[:120]}"
-
-    return "", f"{last_err} (재시도 실패)"
+        data = r.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return "", f"{model_name}: 응답 후보 없음 {str(data)[:100]}"
+        parts = candidates[0].get("content", {}).get("parts", [])
+        summary = "".join(p.get("text", "") for p in parts).strip()
+        if summary and len(summary) > 5:
+            return summary[:150], None
+        return "", f"{model_name}: 빈 응답"
+    except Exception as e:
+        return "", f"{model_name}: {str(e)[:120]}"
 
 
 def extract_article_summary(url: str, max_chars: int = 150) -> str:
-    """기사 URL에서 본문 추출 후 첫 문장 요약 (newspaper3k → trafilatura)"""
+    """
+    기사 URL에서 본문 추출 후 요약
+    - newspaper3k 먼저 시도 (한국 뉴스 최적)
+    - 실패하면 trafilatura 시도
+    - 모두 실패 시 빈 문자열 반환
+    """
     extracted_text = None
 
+    # 방법 1: newspaper3k (한국 뉴스에 강함)
     if NEWSPAPER_AVAILABLE:
         try:
             article = Article(url, language='ko')
             article.download()
             article.parse()
             extracted_text = article.text
-            if not (extracted_text and len(extracted_text.strip()) >= 50):
+
+            if extracted_text and len(extracted_text.strip()) >= 50:
+                # 충분한 텍스트 추출됨
+                pass
+            else:
                 extracted_text = None
         except Exception:
             extracted_text = None
 
+    # 방법 2: trafilatura (폴백)
     if not extracted_text and trafilatura:
         try:
             response = requests.get(url, timeout=8, headers={
@@ -660,62 +699,49 @@ def extract_article_summary(url: str, max_chars: int = 150) -> str:
             })
             if response.status_code == 200:
                 extracted_text = trafilatura.extract(response.text, include_comments=False)
-                if not (extracted_text and len(extracted_text.strip()) >= 50):
+
+                if extracted_text and len(extracted_text.strip()) >= 50:
+                    pass
+                else:
                     extracted_text = None
         except Exception:
             extracted_text = None
 
+    # 추출 실패
     if not extracted_text:
         return ""
 
+    # 첫 문장 또는 일정 길이 추출
     extracted_text = extracted_text.strip()
-    match = re.search(r'[^.!?\n][.!?]', extracted_text)
+
+    # 첫 문장 찾기 (마침표 기준)
+    match = re.search(r'[^.!?\n]*[.!?]', extracted_text)
     if match:
         summary = match.group(0)[:max_chars]
     else:
+        # 문장 구분이 없으면 앞부분 + 마침표
         summary = extracted_text[:max_chars].rstrip() + "."
+
     return summary.strip()
 
-
-
 def build_mail_html(sel_df):
-    """메일용 HTML 생성 (줄간격/폰트/색상/크기 통일 버전)"""
-    FF = "'맑은 고딕', 'Malgun Gothic', sans-serif"
- 
-    def style(font_size, bold=False):
-        weight = "bold" if bold else "400"
-        return (
-            "line-height:1.8;"
-            f"font-family:{FF};"
-            "color:#000000;"
-            "orphans:2;"
-            f"font-size:{font_size};"
-            f"font-weight:{weight};"
-            "margin-left:0px;margin-bottom:0px;margin-right:0px;margin-top:0px;"
-            "padding-left:0px;padding-bottom:0px;padding-right:0px;padding-top:0px;"
-        )
- 
-    CATEGORY_STYLE = style("12pt", bold=True)
-    BODY_STYLE = style("10pt")
-    PRESS_STYLE = style("8pt")
-    SPACER_STYLE = style("13pt")
-    LINK_STYLE = (
-        f"font-family:{FF};font-size:10pt;font-weight:bold;"
-        "color:#0000ff;text-decoration:underline;"
-    )
- 
-    BLANK = f'<p style="{SPACER_STYLE}">&nbsp;</p>'
- 
+    """메일용 HTML 생성"""
+    FF = "'맑은 고딕','Malgun Gothic',sans-serif"
+    P = f'margin:0;padding:0;line-height:1.8;font-family:{FF};'
+    BLANK = f'<p style="{P}font-size:13pt;">&nbsp;</p>'
     parts = [f'<div style="font-family:{FF};color:#000;">']
+
     for ci, cat in enumerate(MAIL_CATEGORIES):
         group = sel_df[sel_df["메일카테고리"] == cat]
         if group.empty:
             continue
         if ci > 0 and len(parts) > 1:
             parts.append(BLANK)
-        parts.append(f'<p style="{CATEGORY_STYLE}">' + html.escape(cat) + "</p>")
+        parts.append(
+            f'<p style="{P}font-size:12pt;font-weight:bold;color:#000;">'
+            + html.escape(cat) + '</p>'
+        )
         parts.append(BLANK)
- 
         for _, row in group.iterrows():
             title = html.escape(row["제목"])
             link = html.escape(row["링크"], quote=True)
@@ -723,23 +749,29 @@ def build_mail_html(sel_df):
             press = html.escape(row.get("언론사", "") or "")
             if not press.strip():
                 press = html.escape(PRESS_PLACEHOLDER)
- 
+
             parts.append(
-                f'<p style="{BODY_STYLE}">'
+                f'<p style="{P}">'
                 f'<a href="{link}" target="_blank" rel="noopener noreferrer" '
-                f'style="{LINK_STYLE}">{title}</a></p>'
+                f'style="font-family:{FF};font-size:10pt;font-weight:bold;'
+                'color:#0000FF;text-decoration:underline;">'
+                f'{title}</a></p>'
             )
             if summary:
                 for ln in summary.split("\n"):
                     ln = ln.strip()
                     if ln:
-                        parts.append(f'<p style="{BODY_STYLE}">{ln}</p>')
-            parts.append(f'<p style="{PRESS_STYLE}">{press}</p>')
+                        parts.append(
+                            f'<p style="{P}font-size:10pt;font-weight:normal;'
+                            f'color:#000;">{ln}</p>'
+                        )
+            parts.append(
+                f'<p style="{P}font-size:8pt;color:#000;">{press}</p>'
+            )
             parts.append(BLANK)
- 
+
     parts.append("</div>")
     return "".join(parts)
-
 
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
@@ -752,15 +784,16 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         edit = base.copy()
         edit.insert(0, "선택", False)
         edit["메일카테고리"] = edit.apply(
-            lambda r: suggest_category(str(r.get("키워드", "")), str(r.get("제목", ""))),
-            axis=1)
+            lambda r: suggest_category(str(r.get("키워드", "")), str(r.get("제목", ""))), axis=1)
         edit["언론사"] = edit["언론사"].fillna("").apply(
             lambda s: s if str(s).strip() else PRESS_PLACEHOLDER)
 
+        # 요약: 첫 문장 또는 60글자 (간결하게)
         def get_summary(text):
             if not text:
                 return ""
-            match = re.search(r'[^.!?\n][.!?]', text)
+            # 첫 마침표까지만 추출 (없으면 60글자)
+            match = re.search(r'[^.!?\n]*[.!?]', text)
             if match:
                 return match.group(0)[:70]
             return text[:70]
@@ -768,7 +801,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         edit["요약"] = edit["요약초안"].fillna("").apply(get_summary)
         st.session_state["editor_df"] = edit
 
-    edited_tbl = st.data_editor(
+    edited = st.data_editor(
         st.session_state["editor_df"],
         hide_index=True, use_container_width=True, height=430,
         column_order=["선택", "키워드", "메일카테고리", "제목", "요약", "언론사", "발행시각", "링크"],
@@ -782,115 +815,111 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width="small"),
             "링크": st.column_config.LinkColumn("링크", display_text="열기"),
             "요약초안": None,
-            "카테고리": None,
-            "출처": None,
+            "카테고리": None, "출처": None,
         },
         disabled=["제목", "키워드", "발행시각", "링크"],
         key="editor",
     )
 
-    sel = edited_tbl[edited_tbl["선택"] == True].copy()
-    st.write(f"선택된 기사: {len(sel)}건")
+    sel = edited[edited["선택"] == True].copy()
+    st.write(f"선택된 기사: **{len(sel)}건**")
 
     if not sel.empty:
         need_press = sel[sel["언론사"].astype(str).str.strip().isin(["", PRESS_PLACEHOLDER])]
         if not need_press.empty:
             st.warning(f"⚠️ 선택한 기사 중 {len(need_press)}건은 언론사가 비어 있습니다.")
 
-    if st.button("📋 메일 본문 생성", type="primary", use_container_width=True, disabled=sel.empty):
+    if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
+                 disabled=sel.empty):
+
         use_ai = use_gemini and gemini_key
 
         if use_ai:
-            st.write("AI 요약 설정: ✓ Google Gemini API 활성화")
+            st.write("**AI 요약 설정:**")
+            st.write("✓ Google Gemini API 활성화")
 
         with st.spinner("기사 본문 크롤링 및 요약 생성 중..."):
             prog = st.progress(0, text="처리 중... (0/0)")
             updated_count = 0
-            fallback_count = 0
             failed_urls = []
             error_logs = []
 
+            # sel을 copy해서 인덱스 리셋
             sel_copy = sel.copy().reset_index(drop=True)
 
             for idx, row in sel_copy.iterrows():
-                prog.progress((idx + 1) / len(sel_copy),
-                              text=f"처리 중... ({idx + 1}/{len(sel_copy)})")
+                prog.progress(
+                    (idx + 1) / len(sel_copy),
+                    text=f"처리 중... ({idx + 1}/{len(sel_copy)})"
+                )
                 url = row.get("링크", "")
-                draft = str(row.get("요약초안", "") or "").strip()
+                if url:
+                    article_text = None
 
-                if not url:
-                    continue
+                    if use_ai:
+                        # Gemini AI 요약 (크롤링 + AI)
+                        # 1순위: BeautifulSoup (한국 뉴스 최적)
+                        article_text = extract_text_with_bs4(url)
 
-                if use_ai:
-                    # 본문 추출: BeautifulSoup → newspaper3k → trafilatura
-                    article_text = extract_text_with_bs4(url)
-                    if not article_text or len(article_text.strip()) < 50:
-                        try:
-                            article = Article(url, language='ko')
-                            article.download()
-                            article.parse()
-                            article_text = article.text
-                        except Exception:
-                            article_text = None
-                    if not article_text or len(article_text.strip()) < 50:
-                        article_text = extract_article_summary(url)
+                        # 2순위: newspaper3k (폴백)
+                        if not article_text or len(article_text.strip()) < 50:
+                            try:
+                                article = Article(url, language='ko')
+                                article.download(timeout=8)
+                                article.parse()
+                                article_text = article.text
+                            except Exception:
+                                article_text = None
 
-                    if article_text and len(article_text.strip()) >= 50:
-                        summary, gemini_err = generate_summary_with_gemini(article_text, gemini_key)
-                        if summary:
-                            sel_copy.loc[idx, "요약"] = summary
-                            updated_count += 1
-                        else:
-                            # Gemini 실패 → 네이버 요약초안 폴백
-                            error_logs.append(f"[Gemini실패] {gemini_err}")
-                            if draft:
-                                sel_copy.loc[idx, "요약"] = draft[:150]
-                                fallback_count += 1
+                        # 3순위: trafilatura (마지막 폴백)
+                        if not article_text or len(article_text.strip()) < 50:
+                            article_text = extract_article_summary(url)
+
+                        # Gemini로 요약
+                        if article_text and len(article_text.strip()) >= 50:
+                            summary, gemini_err = generate_summary_with_gemini(article_text, gemini_key)
+
+                            if summary:
+                                # Gemini 요약 성공
+                                sel_copy.loc[idx, "요약"] = summary
+                                updated_count += 1
                             else:
+                                # Gemini 실패 → 에러 기록 + 첫 문장 폴백
+                                error_logs.append(f"[Gemini실패] {gemini_err}")
                                 match = re.search(r'[^.!?\n]*[.!?]', article_text)
                                 if match:
                                     sel_copy.loc[idx, "요약"] = match.group(0)[:150]
                                 else:
                                     sel_copy.loc[idx, "요약"] = article_text[:150].rstrip() + "."
                                 failed_urls.append(url[:50])
-                    else:
-                        # 크롤링 실패 → 네이버 요약초안 폴백
-                        if draft:
-                            sel_copy.loc[idx, "요약"] = draft[:150]
-                            fallback_count += 1
-                            error_logs.append(f"[크롤링실패→요약초안 사용] {url[:50]}")
                         else:
                             failed_urls.append(url[:50])
-                            error_logs.append(f"[크롤링실패·요약초안없음] {url[:50]}")
-                else:
-                    # 기존 방식 (AI 없이 자동 크롤링)
-                    summary = extract_article_summary(url)
-                    if summary:
-                        sel_copy.loc[idx, "요약"] = summary
-                        updated_count += 1
-                    elif draft:
-                        sel_copy.loc[idx, "요약"] = draft[:150]
-                        fallback_count += 1
+                            error_logs.append(f"크롤링 실패/텍스트 부족: {url[:50]}")
                     else:
-                        failed_urls.append(url[:50])
+                        # 기존 방식 (자동 크롤링)
+                        summary = extract_article_summary(url)
+                        if summary:
+                            sel_copy.loc[idx, "요약"] = summary
+                            updated_count += 1
+                        else:
+                            failed_urls.append(url[:50])
 
-                time.sleep(0.5)  # 서버 부하 방지 + 503 완화
+                time.sleep(0.2)  # 서버 부하 방지
 
             prog.empty()
 
-            st.write(f"결과: ✓ AI 요약 {updated_count}건 · "
-                     f"요약초안 대체 {fallback_count}건 / 전체 {len(sel_copy)}건")
+            # 결과 표시
+            st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 Gemini 요약 성공")
             if error_logs:
-                st.warning(f"⚠️ {len(error_logs)}개 기사는 요약초안/첫문장으로 대체됨")
-                with st.expander("🔍 상세 로그 확인"):
-                    for log in error_logs[:12]:
+                st.warning(f"⚠️ {len(error_logs)}개 기사에서 문제 발생 (첫 문장으로 대체됨)")
+                with st.expander("🔍 실패 원인 확인 (Gemini 에러 메시지)"):
+                    for log in error_logs[:8]:
                         st.text(f"• {log}")
 
             sel = sel_copy
 
         sel["_c"] = sel["메일카테고리"].map({c: i for i, c in enumerate(MAIL_CATEGORIES)})
         sel = sel.sort_values(["_c", "발행시각"], ascending=[True, False])
-
         mail_html = build_mail_html(sel)
         st.session_state["mail_html"] = mail_html
         st.success("✅ 메일 본문이 생성되었습니다.")
@@ -900,24 +929,26 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         st.caption("아래 [메일 본문 복사] 버튼을 누르면 서식이 클립보드에 담깁니다.")
 
         mail_html = st.session_state["mail_html"]
-        html_js = json.dumps(mail_html)
+        import json as _json
+        html_js = _json.dumps(mail_html)
 
+        # 메일 복사 버튼 (붉은색, 큰 타이틀 바로 아래)
         copy_widget = f"""
         <div style="font-family:'맑은 고딕',sans-serif;">
           <button id="copyBtn" style="padding:10px 18px;font-size:14px;
-            background:#ff4b4b;color:#fff;border:none;border-radius:6px;
-            cursor:pointer;width:100%;font-weight:bold;">
+              background:#ff4b4b;color:#fff;border:none;border-radius:6px;
+              cursor:pointer;width:100%;font-weight:bold;">
             📋 메일 본문 복사 (서식 유지)
           </button>
           <span id="copyMsg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
         </div>
-        <div id="preview" style="display:none;">{mail_html}</div>
         <script>
         const htmlStr = {html_js};
         document.getElementById('copyBtn').addEventListener('click', async () => {{
           try {{
             const blob = new Blob([htmlStr], {{type: 'text/html'}});
-            const textBlob = new Blob([document.getElementById('preview').innerText], {{type: 'text/plain'}});
+            const textBlob = new Blob([document.getElementById('preview').innerText],
+                                      {{type: 'text/plain'}});
             await navigator.clipboard.write([
               new ClipboardItem({{'text/html': blob, 'text/plain': textBlob}})
             ]);
@@ -934,19 +965,19 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         }});
         </script>
         """
-        components.html(copy_widget, height=80, scrolling=False)
+        st.components.v1.html(copy_widget, height=100, scrolling=False)
 
+        # 메일 본문 미리보기
         with st.expander("📨 메일 본문 미리보기", expanded=True):
             preview_widget = f"""
-            <div style="font-family:'맑은 고딕',sans-serif;">{mail_html}</div>
+            <div id="preview" style="font-family:'맑은 고딕',sans-serif;">{mail_html}</div>
             """
-            components.html(preview_widget, height=500, scrolling=True)
+            st.components.v1.html(preview_widget, height=500, scrolling=True)
 
+        # HTML 다운로드
         full_html = ("<!doctype html><html><head><meta charset='utf-8'></head>"
                      "<body>" + mail_html + "</body></html>")
         st.download_button(
-            "📥 (백업) 메일 HTML 파일 다운로드",
-            data=full_html.encode("utf-8"),
+            "📥 (백업) 메일 HTML 파일 다운로드", data=full_html.encode("utf-8"),
             file_name=f"뉴스클리핑_메일_{dt.datetime.now(KST).strftime('%Y%m%d')}.html",
-            mime="text/html",
-            use_container_width=True)
+            mime="text/html", use_container_width=True)
