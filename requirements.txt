@@ -5,5 +5,4 @@ pandas
 openpyxl
 newspaper3k
 trafilatura
-google-genai
 beautifulsoup4
