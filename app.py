@@ -707,6 +707,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             prog = st.progress(0, text="처리 중... (0/0)")
             updated_count = 0
             failed_urls = []
+            error_logs = []
 
             # sel을 copy해서 인덱스 리셋
             sel_copy = sel.copy().reset_index(drop=True)
@@ -741,14 +742,20 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
                         # Gemini로 요약
                         if article_text and len(article_text.strip()) >= 50:
-                            summary = generate_summary_with_gemini(article_text, gemini_key)
-                            if summary:
-                                sel_copy.loc[idx, "요약"] = summary
-                                updated_count += 1
-                            else:
+                            try:
+                                summary = generate_summary_with_gemini(article_text, gemini_key)
+                                if summary:
+                                    sel_copy.loc[idx, "요약"] = summary
+                                    updated_count += 1
+                                else:
+                                    failed_urls.append(url[:50])
+                                    error_logs.append(f"Gemini 응답 없음: {url[:50]}")
+                            except Exception as e:
                                 failed_urls.append(url[:50])
+                                error_logs.append(f"Gemini API 오류: {str(e)[:100]}")
                         else:
                             failed_urls.append(url[:50])
+                            error_logs.append(f"크롤링 실패/텍스트 부족: {url[:50]}")
                     else:
                         # 기존 방식 (자동 크롤링)
                         summary = extract_article_summary(url)
@@ -765,7 +772,10 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             # 결과 표시
             st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 기사 요약 완료")
             if failed_urls:
-                st.info(f"ℹ️ {len(failed_urls)}개 기사는 요약 실패 (링크 접근 불가 등)")
+                st.warning(f"⚠️ {len(failed_urls)}개 기사는 요약 실패")
+                with st.expander("🔍 실패 원인 확인"):
+                    for log in error_logs[:5]:
+                        st.text(f"• {log}")
 
             sel = sel_copy
 
