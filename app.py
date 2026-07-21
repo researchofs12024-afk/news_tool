@@ -725,23 +725,43 @@ def extract_article_summary(url: str, max_chars: int = 150) -> str:
     return summary.strip()
 
 def build_mail_html(sel_df):
-    """메일용 HTML 생성"""
-    FF = "'맑은 고딕','Malgun Gothic',sans-serif"
-    P = f'margin:0;padding:0;line-height:1.8;font-family:{FF};'
-    BLANK = f'<p style="{P}font-size:13pt;">&nbsp;</p>'
-    parts = [f'<div style="font-family:{FF};color:#000;">']
+    """메일용 HTML 생성 (줄간격/폰트/색상/크기 통일 버전)"""
+    FF = "'맑은 고딕', 'Malgun Gothic', sans-serif"
 
+    def style(font_size, bold=False):
+        weight = "bold" if bold else "400"
+        return (
+            "line-height:1.8;"
+            f"font-family:{FF};"
+            "color:#000000;"
+            "orphans:2;"
+            f"font-size:{font_size};"
+            f"font-weight:{weight};"
+            "margin-left:0px;margin-bottom:0px;margin-right:0px;margin-top:0px;"
+            "padding-left:0px;padding-bottom:0px;padding-right:0px;padding-top:0px;"
+        )
+
+    CATEGORY_STYLE = style("12pt", bold=True)
+    BODY_STYLE = style("10pt")
+    PRESS_STYLE = style("8pt")
+    SPACER_STYLE = style("13pt")
+    LINK_STYLE = (
+        f"font-family:{FF};font-size:10pt;font-weight:bold;"
+        "color:#0000ff;text-decoration:underline;"
+    )
+
+    BLANK = f'<p style="{SPACER_STYLE}">&nbsp;</p>'
+
+    parts = [f'<div style="font-family:{FF};color:#000;">']
     for ci, cat in enumerate(MAIL_CATEGORIES):
         group = sel_df[sel_df["메일카테고리"] == cat]
         if group.empty:
             continue
         if ci > 0 and len(parts) > 1:
             parts.append(BLANK)
-        parts.append(
-            f'<p style="{P}font-size:12pt;font-weight:bold;color:#000;">'
-            + html.escape(cat) + '</p>'
-        )
+        parts.append(f'<p style="{CATEGORY_STYLE}">' + html.escape(cat) + "</p>")
         parts.append(BLANK)
+
         for _, row in group.iterrows():
             title = html.escape(row["제목"])
             link = html.escape(row["링크"], quote=True)
@@ -751,23 +771,16 @@ def build_mail_html(sel_df):
                 press = html.escape(PRESS_PLACEHOLDER)
 
             parts.append(
-                f'<p style="{P}">'
+                f'<p style="{BODY_STYLE}">'
                 f'<a href="{link}" target="_blank" rel="noopener noreferrer" '
-                f'style="font-family:{FF};font-size:10pt;font-weight:bold;'
-                'color:#0000FF;text-decoration:underline;">'
-                f'{title}</a></p>'
+                f'style="{LINK_STYLE}">{title}</a></p>'
             )
             if summary:
                 for ln in summary.split("\n"):
                     ln = ln.strip()
                     if ln:
-                        parts.append(
-                            f'<p style="{P}font-size:10pt;font-weight:normal;'
-                            f'color:#000;">{ln}</p>'
-                        )
-            parts.append(
-                f'<p style="{P}font-size:8pt;color:#000;">{press}</p>'
-            )
+                        parts.append(f'<p style="{BODY_STYLE}">{ln}</p>')
+            parts.append(f'<p style="{PRESS_STYLE}">{press}</p>')
             parts.append(BLANK)
 
     parts.append("</div>")
