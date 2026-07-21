@@ -568,11 +568,62 @@ GEMINI_PROMPT = """뉴스 기사 헤드라인 작성 (명사형 필수)
 
 헤드라인:"""
 
-# 최신 모델 우선, 실패 시 순차 폴백
-GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+# 선호 모델 (이 순서로 사용 가능한 것 중 첫 번째 선택). 실제 목록은 API에서 조회.
+GEMINI_PREFERRED = ["flash", "flash-latest", "pro"]
 
 
-def generate_summary_with_gemini(article_text: str, gemini_key: str):
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_gemini_model(gemini_key: str):
+    """
+    이 키에서 실제 사용 가능한 모델 목록을 조회해 flash 계열을 우선 선택.
+    반환: (모델명 or "", 에러 or None)
+    """
+    if not gemini_key:
+        return "", "키 없음"
+
+    headers = {"x-goog-api-key": gemini_key}
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers=headers, timeout=15
+        )
+        if r.status_code != 200:
+            return "", f"모델목록 조회 실패 HTTP {r.status_code}: {r.text[:120]}"
+
+        models = r.json().get("models", [])
+        # generateContent 지원 모델만
+        usable = []
+        for m in models:
+            name = m.get("name", "").replace("models/", "")
+            methods = m.get("supportedGenerationMethods", [])
+            if "generateContent" in methods:
+                usable.append(name)
+
+        if not usable:
+            return "", "generateContent 지원 모델 없음"
+
+        # flash 계열 우선, gemini 계열 우선
+        def score(n):
+            s = 0
+            if "flash" in n:
+                s += 10
+            if "gemini" in n:
+                s += 5
+            if "latest" in n:
+                s += 2
+            # 실험/구버전은 후순위
+            if "exp" in n or "1.5" in n or "1.0" in n:
+                s -= 3
+            return s
+
+        usable.sort(key=score, reverse=True)
+        return usable[0], None
+
+    except Exception as e:
+        return "", f"모델목록 조회 오류: {str(e)[:120]}"
+
+
+def generate_summary_with_gemini(article_text: str, gemini_key: str, model_name: str = ""):
     """
     Gemini REST API 직접 호출로 명사형 헤드라인 요약 생성.
     SDK를 거치지 않고 x-goog-api-key 헤더로 키 전달 → AQ. 신형 키 호환.
@@ -580,6 +631,12 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str):
     """
     if not gemini_key or not article_text:
         return "", "키/텍스트 없음"
+
+    # 모델 미지정 시 자동 조회
+    if not model_name:
+        model_name, err = get_gemini_model(gemini_key)
+        if not model_name:
+            return "", f"모델 선택 실패: {err}"
 
     prompt = GEMINI_PROMPT.format(text=article_text[:2500])
     headers = {
@@ -591,30 +648,22 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str):
         "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3},
     }
 
-    last_error = None
-    for model_name in GEMINI_MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=15)
-            if r.status_code != 200:
-                last_error = f"{model_name} HTTP {r.status_code}: {r.text[:120]}"
-                continue
-            data = r.json()
-            # 응답 파싱
-            candidates = data.get("candidates", [])
-            if not candidates:
-                last_error = f"{model_name}: 응답 후보 없음 {str(data)[:100]}"
-                continue
-            parts = candidates[0].get("content", {}).get("parts", [])
-            summary = "".join(p.get("text", "") for p in parts).strip()
-            if summary and len(summary) > 5:
-                return summary[:150], None
-            last_error = f"{model_name}: 빈 응답"
-        except Exception as e:
-            last_error = f"{model_name}: {str(e)[:120]}"
-            continue
-
-    return "", last_error or "모든 모델 실패"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        if r.status_code != 200:
+            return "", f"{model_name} HTTP {r.status_code}: {r.text[:120]}"
+        data = r.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return "", f"{model_name}: 응답 후보 없음 {str(data)[:100]}"
+        parts = candidates[0].get("content", {}).get("parts", [])
+        summary = "".join(p.get("text", "") for p in parts).strip()
+        if summary and len(summary) > 5:
+            return summary[:150], None
+        return "", f"{model_name}: 빈 응답"
+    except Exception as e:
+        return "", f"{model_name}: {str(e)[:120]}"
 
 
 def extract_article_summary(url: str, max_chars: int = 150) -> str:
