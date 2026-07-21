@@ -16,6 +16,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 try:
+    from newspaper import Article
+    NEWSPAPER_AVAILABLE = True
+except ImportError:
+    NEWSPAPER_AVAILABLE = False
+
+try:
     import trafilatura
 except ImportError:
     trafilatura = None
@@ -437,40 +443,60 @@ def suggest_category(keyword: str, title: str) -> str:
 def extract_article_summary(url: str, max_chars: int = 150) -> str:
     """
     기사 URL에서 본문 추출 후 요약
-    - trafilatura 사용 (신문 기사 최적화)
-    - 실패 시 빈 문자열 반환
+    - newspaper3k 먼저 시도 (한국 뉴스 최적)
+    - 실패하면 trafilatura 시도
+    - 모두 실패 시 빈 문자열 반환
     """
-    if not trafilatura:
+    extracted_text = None
+
+    # 방법 1: newspaper3k (한국 뉴스에 강함)
+    if NEWSPAPER_AVAILABLE:
+        try:
+            article = Article(url, language='ko')
+            article.download()
+            article.parse()
+            extracted_text = article.text
+
+            if extracted_text and len(extracted_text.strip()) >= 50:
+                # 충분한 텍스트 추출됨
+                pass
+            else:
+                extracted_text = None
+        except Exception:
+            extracted_text = None
+
+    # 방법 2: trafilatura (폴백)
+    if not extracted_text and trafilatura:
+        try:
+            response = requests.get(url, timeout=8, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'
+            })
+            if response.status_code == 200:
+                extracted_text = trafilatura.extract(response.text, include_comments=False)
+
+                if extracted_text and len(extracted_text.strip()) >= 50:
+                    pass
+                else:
+                    extracted_text = None
+        except Exception:
+            extracted_text = None
+
+    # 추출 실패
+    if not extracted_text:
         return ""
 
-    try:
-        # 타임아웃 짧게 (1개 기사만 처리하므로)
-        response = requests.get(url, timeout=8, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'
-        })
-        if response.status_code != 200:
-            return ""
+    # 첫 문장 또는 일정 길이 추출
+    extracted_text = extracted_text.strip()
 
-        # trafilatura로 본문 추출
-        extracted_text = trafilatura.extract(response.text, include_comments=False)
-        if not extracted_text or len(extracted_text.strip()) < 20:
-            # 추출된 텍스트가 너무 짧으면 실패로 간주
-            return ""
+    # 첫 문장 찾기 (마침표 기준)
+    match = re.search(r'[^.!?\n]*[.!?]', extracted_text)
+    if match:
+        summary = match.group(0)[:max_chars]
+    else:
+        # 문장 구분이 없으면 앞부분 + 마침표
+        summary = extracted_text[:max_chars].rstrip() + "."
 
-        # 첫 문장만 추출 (마침표 기준)
-        match = re.search(r'[^.!?\n]*[.!?]', extracted_text)
-        if match:
-            summary = match.group(0)[:max_chars]
-        else:
-            # 문장 구분이 없으면 앞부분 + 마침표
-            summary = extracted_text[:max_chars].rstrip() + "."
-
-        return summary.strip()
-
-    except requests.exceptions.Timeout:
-        return ""
-    except Exception as e:
-        return ""
+    return summary.strip()
 
 def build_mail_html(sel_df):
     """메일용 HTML 생성"""
@@ -582,11 +608,14 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         # 원문 크롤링으로 요약 생성
         st.write("**디버깅 정보:**")
 
-        if not trafilatura:
-            st.warning("⚠️ trafilatura 라이브러리가 설치되지 않았습니다. pip install trafilatura 실행 후 재시작하세요.")
+        if NEWSPAPER_AVAILABLE:
+            st.write("✓ newspaper3k 설치됨 (한국 뉴스 최적)")
+        if trafilatura:
+            st.write("✓ trafilatura 설치됨 (폴백)")
+
+        if not NEWSPAPER_AVAILABLE and not trafilatura:
+            st.warning("⚠️ 크롤링 라이브러리가 설치되지 않았습니다.\n다음 중 하나 실행 후 재시작:\n`pip install newspaper3k` 또는 `pip install trafilatura`")
             st.stop()
-        else:
-            st.write("✓ trafilatura 설치됨")
 
         with st.spinner("기사 본문에서 요약 추출 중..."):
             prog = st.progress(0, text="크롤링 중... (0/0)")
