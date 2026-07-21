@@ -938,47 +938,45 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         st.success("✅ 메일 본문이 생성되었습니다.")
 
     if "mail_html" in st.session_state:
-        st.subheader("메일 본문")
-        st.caption("아래 [메일 본문 복사] 버튼을 누르면 서식이 클립보드에 담깁니다.")
-
-        mail_html = st.session_state["mail_html"]
-        import json as _json
-        html_js = _json.dumps(mail_html)
-
-        # 메일 복사 버튼 (붉은색, 큰 타이틀 바로 아래)
-        copy_widget = f"""
-        <div style="font-family:'맑은 고딕',sans-serif;">
-          <button id="copyBtn" style="padding:10px 18px;font-size:14px;
-              background:#ff4b4b;color:#fff;border:none;border-radius:6px;
-              cursor:pointer;width:100%;font-weight:bold;">
-            📋 메일 본문 복사 (서식 유지)
-          </button>
-          <span id="copyMsg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
-        </div>
-        <script>
-        const htmlStr = {html_js};
-        document.getElementById('copyBtn').addEventListener('click', async () => {{
-          try {{
-            const blob = new Blob([htmlStr], {{type: 'text/html'}});
-            const textBlob = new Blob([document.getElementById('preview').innerText],
-                                      {{type: 'text/plain'}});
-            await navigator.clipboard.write([
-              new ClipboardItem({{'text/html': blob, 'text/plain': textBlob}})
-            ]);
-            document.getElementById('copyMsg').innerText = '✓ 복사됨! 메일에 붙여넣으세요';
-          }} catch (e) {{
-            const range = document.createRange();
-            range.selectNode(document.getElementById('preview'));
-            window.getSelection().removeAllRanges();
-            window.getSelection().addRange(range);
-            document.execCommand('copy');
-            window.getSelection().removeAllRanges();
-            document.getElementById('copyMsg').innerText = '✓ 복사됨 (폴백)';
-          }}
-        }});
-        </script>
-        """
-        st.components.v1.html(copy_widget, height=100, scrolling=False)
+    st.subheader("메일 본문")
+    st.caption("아래 [메일 본문 복사] 버튼을 누르면 서식이 클립보드에 담깁니다.")
+    mail_html = st.session_state["mail_html"]
+    import json as _json
+    html_js = _json.dumps(mail_html)
+    copy_widget = f"""
+    <div id="preview" style="position:absolute;left:-9999px;top:-9999px;">{mail_html}</div>
+    <div style="font-family:'맑은 고딕',sans-serif;">
+      <button id="copyBtn" style="padding:10px 18px;font-size:14px;
+          background:#ff4b4b;color:#fff;border:none;border-radius:6px;
+          cursor:pointer;width:100%;font-weight:bold;">
+        📋 메일 본문 복사 (서식 유지)
+      </button>
+      <span id="copyMsg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
+    </div>
+    <script>
+    const htmlStr = {html_js};
+    document.getElementById('copyBtn').addEventListener('click', async () => {{
+      const preview = document.getElementById('preview');
+      try {{
+        const blob = new Blob([htmlStr], {{type: 'text/html'}});
+        const textBlob = new Blob([preview.innerText], {{type: 'text/plain'}});
+        await navigator.clipboard.write([
+          new ClipboardItem({{'text/html': blob, 'text/plain': textBlob}})
+        ]);
+        document.getElementById('copyMsg').innerText = '✓ 복사됨! 메일에 붙여넣으세요';
+      }} catch (e) {{
+        const range = document.createRange();
+        range.selectNode(preview);
+        window.getSelection().removeAllRanges();
+        window.getSelection().addRange(range);
+        document.execCommand('copy');
+        window.getSelection().removeAllRanges();
+        document.getElementById('copyMsg').innerText = '✓ 복사됨 (폴백)';
+      }}
+    }});
+    </script>
+    """
+    st.components.v1.html(copy_widget, height=100, scrolling=False)
 
         # 메일 본문 미리보기
         with st.expander("📨 메일 본문 미리보기", expanded=True):
