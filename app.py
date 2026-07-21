@@ -26,11 +26,19 @@ try:
 except ImportError:
     trafilatura = None
 
+# Gemini: 신규 패키지(google-genai) 우선, 없으면 구 패키지(google-generativeai)
+GEMINI_MODE = None
 try:
-    import google.generativeai as genai
+    from google import genai as genai_new
+    GEMINI_MODE = "new"
     GEMINI_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
+    try:
+        import google.generativeai as genai
+        GEMINI_MODE = "old"
+        GEMINI_AVAILABLE = True
+    except ImportError:
+        GEMINI_AVAILABLE = False
 
 try:
     from bs4 import BeautifulSoup
@@ -350,10 +358,15 @@ with st.sidebar:
     if gemini_key:
         use_gemini = st.checkbox("Google Gemini AI로 요약", value=True,
                                 help="✓ API 키 설정됨")
-        st.caption("✓ Gemini API 준비 완료")
+        st.caption(f"✓ Gemini 준비 완료 (패키지: {GEMINI_MODE})")
+        # API 키 형식 검증 (정상 키는 AIza로 시작)
+        if not gemini_key.startswith("AIza"):
+            st.error("⚠️ API 키 형식이 이상합니다. Google AI Studio API 키는 보통 "
+                     "`AIza`로 시작합니다. https://aistudio.google.com/app/apikey 에서 "
+                     "발급한 키가 맞는지 확인하세요. (현재 키로는 요약이 실패할 수 있음)")
     else:
         use_gemini = False
-        st.warning("⚠️ GEMINI_API_KEY가 설정되지 않았습니다.\n`.streamlit/secrets.toml`에 키를 추가하세요.")
+        st.warning("⚠️ GEMINI_API_KEY가 설정되지 않았습니다.\n앱 Settings → Secrets에 키를 추가하세요.")
 
     st.divider()
     st.write("**카테고리 선택**")
@@ -557,19 +570,7 @@ def extract_text_with_bs4(url: str) -> str:
         return ""
 
 
-def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
-    """
-    Gemini API로 명사형 헤드라인 요약 생성
-    """
-    if not GEMINI_AVAILABLE or not gemini_key or not article_text:
-        return ""
-
-    try:
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-
-        response = model.generate_content(
-            f"""뉴스 기사 헤드라인 작성 (명사형 필수)
+GEMINI_PROMPT = """뉴스 기사 헤드라인 작성 (명사형 필수)
 
 반드시 지킬 규칙:
 1. 명사형 종결 (추진, 확정, 결정, 완료, 진행, 개시 등)
@@ -579,18 +580,59 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
 5. 헤드라인만 출력
 
 기사:
-{article_text[:2500]}
+{text}
 
 헤드라인:"""
-        )
 
-        summary = response.text.strip()
-        if summary and len(summary) > 10:
-            return summary[:150]
-        return ""
+# 최신 모델 우선, 실패 시 순차 폴백
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"]
 
-    except Exception:
-        return ""
+
+def generate_summary_with_gemini(article_text: str, gemini_key: str):
+    """
+    Gemini API로 명사형 헤드라인 요약 생성
+    반환: (요약문 or "", 에러메시지 or None)
+    """
+    if not GEMINI_AVAILABLE or not gemini_key or not article_text:
+        return "", "라이브러리/키/텍스트 없음"
+
+    prompt = GEMINI_PROMPT.format(text=article_text[:2500])
+    last_error = None
+
+    # 신규 패키지 (google-genai)
+    if GEMINI_MODE == "new":
+        try:
+            client = genai_new.Client(api_key=gemini_key)
+            for model_name in GEMINI_MODELS:
+                try:
+                    resp = client.models.generate_content(model=model_name, contents=prompt)
+                    summary = (resp.text or "").strip()
+                    if summary and len(summary) > 5:
+                        return summary[:150], None
+                except Exception as e:
+                    last_error = f"{model_name}: {str(e)[:120]}"
+                    continue
+        except Exception as e:
+            return "", f"클라이언트 생성 실패: {str(e)[:120]}"
+
+    # 구 패키지 (google-generativeai)
+    elif GEMINI_MODE == "old":
+        try:
+            genai.configure(api_key=gemini_key)
+            for model_name in GEMINI_MODELS:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    resp = model.generate_content(prompt)
+                    summary = resp.text.strip()
+                    if summary and len(summary) > 5:
+                        return summary[:150], None
+                except Exception as e:
+                    last_error = f"{model_name}: {str(e)[:120]}"
+                    continue
+        except Exception as e:
+            return "", f"configure 실패: {str(e)[:120]}"
+
+    return "", last_error or "모든 모델 실패"
 
 
 def extract_article_summary(url: str, max_chars: int = 150) -> str:
@@ -804,27 +846,21 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
                         # Gemini로 요약
                         if article_text and len(article_text.strip()) >= 50:
-                            try:
-                                summary = generate_summary_with_gemini(article_text, gemini_key)
+                            summary, gemini_err = generate_summary_with_gemini(article_text, gemini_key)
 
-                                # Gemini 응답 없으면 BeautifulSoup 텍스트에서 직접 추출 (폴백)
-                                if not summary:
-                                    # 첫 문장 추출
-                                    match = re.search(r'[^.!?\n]*[.!?]', article_text)
-                                    if match:
-                                        summary = match.group(0)[:150]
-                                    else:
-                                        summary = article_text[:150].rstrip() + "."
-
-                                if summary:
-                                    sel_copy.loc[idx, "요약"] = summary
-                                    updated_count += 1
+                            if summary:
+                                # Gemini 요약 성공
+                                sel_copy.loc[idx, "요약"] = summary
+                                updated_count += 1
+                            else:
+                                # Gemini 실패 → 에러 기록 + 첫 문장 폴백
+                                error_logs.append(f"[Gemini실패] {gemini_err}")
+                                match = re.search(r'[^.!?\n]*[.!?]', article_text)
+                                if match:
+                                    sel_copy.loc[idx, "요약"] = match.group(0)[:150]
                                 else:
-                                    failed_urls.append(url[:50])
-                                    error_logs.append(f"요약 추출 불가: {url[:50]}")
-                            except Exception as e:
+                                    sel_copy.loc[idx, "요약"] = article_text[:150].rstrip() + "."
                                 failed_urls.append(url[:50])
-                                error_logs.append(f"Gemini API 오류: {str(e)[:100]}")
                         else:
                             failed_urls.append(url[:50])
                             error_logs.append(f"크롤링 실패/텍스트 부족: {url[:50]}")
@@ -842,11 +878,11 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             prog.empty()
 
             # 결과 표시
-            st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 기사 요약 완료")
-            if failed_urls:
-                st.warning(f"⚠️ {len(failed_urls)}개 기사는 요약 실패")
-                with st.expander("🔍 실패 원인 확인"):
-                    for log in error_logs[:5]:
+            st.write(f"**결과:** ✓ {updated_count}/{len(sel_copy)}개 Gemini 요약 성공")
+            if error_logs:
+                st.warning(f"⚠️ {len(error_logs)}개 기사에서 문제 발생 (첫 문장으로 대체됨)")
+                with st.expander("🔍 실패 원인 확인 (Gemini 에러 메시지)"):
+                    for log in error_logs[:8]:
                         st.text(f"• {log}")
 
             sel = sel_copy
