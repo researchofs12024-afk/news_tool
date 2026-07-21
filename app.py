@@ -218,12 +218,12 @@ def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5, progress_bar=Non
 
     # 네이버 우선, 최신순 정렬
     df["_p"] = (df["출처"] == "네이버").astype(int)
-    df = df.sort_values(["_p", "발행시각"], ascending=[False, False])
+    df = df.sort_values(["_p", "발행시각"], ascending=[False, False]).reset_index(drop=True)
 
     keep_rows = []
     total = len(df)
 
-    for idx, row in df.iterrows():
+    for current_idx, (idx, row) in enumerate(df.iterrows()):
         title = row["제목"]
         title_len = len(title)
         is_dup = False
@@ -263,11 +263,12 @@ def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.5, progress_bar=Non
         if not is_dup:
             keep_rows.append(row)
 
-        # 진행률 표시
-        if progress_bar is not None:
+        # 진행률 표시 (current_idx 사용 - 0부터 시작)
+        if progress_bar is not None and total > 0:
+            progress = min((current_idx + 1) / total, 1.0)  # 1.0 초과 방지
             progress_bar.progress(
-                (idx + 1) / total,
-                text=f"중복 제거 중... ({idx + 1}/{total})"
+                progress,
+                text=f"중복 제거 중... ({current_idx + 1}/{total})"
             )
 
     result_df = pd.DataFrame(keep_rows).reset_index(drop=True)
