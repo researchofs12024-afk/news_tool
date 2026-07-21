@@ -744,12 +744,22 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                         if article_text and len(article_text.strip()) >= 50:
                             try:
                                 summary = generate_summary_with_gemini(article_text, gemini_key)
+
+                                # Gemini 응답 없으면 BeautifulSoup 텍스트에서 직접 추출 (폴백)
+                                if not summary:
+                                    # 첫 문장 추출
+                                    match = re.search(r'[^.!?\n]*[.!?]', article_text)
+                                    if match:
+                                        summary = match.group(0)[:150]
+                                    else:
+                                        summary = article_text[:150].rstrip() + "."
+
                                 if summary:
                                     sel_copy.loc[idx, "요약"] = summary
                                     updated_count += 1
                                 else:
                                     failed_urls.append(url[:50])
-                                    error_logs.append(f"Gemini 응답 없음: {url[:50]}")
+                                    error_logs.append(f"요약 추출 불가: {url[:50]}")
                             except Exception as e:
                                 failed_urls.append(url[:50])
                                 error_logs.append(f"Gemini API 오류: {str(e)[:100]}")
