@@ -453,7 +453,8 @@ def extract_article_summary(url: str, max_chars: int = 150) -> str:
 
         # trafilatura로 본문 추출
         extracted_text = trafilatura.extract(response.text, include_comments=False)
-        if not extracted_text:
+        if not extracted_text or len(extracted_text.strip()) < 20:
+            # 추출된 텍스트가 너무 짧으면 실패로 간주
             return ""
 
         # 첫 문장만 추출 (마침표 기준)
@@ -461,13 +462,14 @@ def extract_article_summary(url: str, max_chars: int = 150) -> str:
         if match:
             summary = match.group(0)[:max_chars]
         else:
-            summary = extracted_text[:max_chars]
+            # 문장 구분이 없으면 앞부분 + 마침표
+            summary = extracted_text[:max_chars].rstrip() + "."
 
         return summary.strip()
 
     except requests.exceptions.Timeout:
         return ""
-    except Exception:
+    except Exception as e:
         return ""
 
 def build_mail_html(sel_df):
@@ -578,21 +580,35 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
                  disabled=sel.empty):
         # 원문 크롤링으로 요약 생성
+        if not trafilatura:
+            st.warning("⚠️ trafilatura 라이브러리가 설치되지 않았습니다. pip install trafilatura 실행 후 재시작하세요.")
+            st.stop()
+
         with st.spinner("기사 본문에서 요약 추출 중..."):
             prog = st.progress(0, text="크롤링 중... (0/0)")
-            for idx, (i, row) in enumerate(sel.iterrows()):
+            updated_count = 0
+
+            # sel을 copy해서 인덱스 리셋
+            sel_copy = sel.copy().reset_index(drop=True)
+
+            for idx, row in sel_copy.iterrows():
                 prog.progress(
-                    (idx + 1) / len(sel),
-                    text=f"크롤링 중... ({idx + 1}/{len(sel)})"
+                    (idx + 1) / len(sel_copy),
+                    text=f"크롤링 중... ({idx + 1}/{len(sel_copy)})"
                 )
                 url = row.get("링크", "")
-                if url and not row.get("요약", "").strip():
-                    # 요약이 비어있으면 크롤링해서 채우기
+                if url:
+                    # 모든 기사에서 크롤링으로 요약 생성 (기존 요약 덮어쓰기)
                     summary = extract_article_summary(url)
                     if summary:
-                        sel.loc[i, "요약"] = summary
+                        sel_copy.loc[idx, "요약"] = summary
+                        updated_count += 1
                 time.sleep(0.3)  # 서버 부하 방지
+
             prog.empty()
+            st.info(f"✓ {updated_count}/{len(sel_copy)}개 기사 요약 업데이트 완료")
+
+            sel = sel_copy
 
         sel["_c"] = sel["메일카테고리"].map({c: i for i, c in enumerate(MAIL_CATEGORIES)})
         sel = sel.sort_values(["_c", "발행시각"], ascending=[True, False])
