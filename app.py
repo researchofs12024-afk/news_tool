@@ -15,6 +15,11 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
+
 st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon="📰", layout="wide")
 
 DEFAULT_KEYWORDS = {
@@ -429,6 +434,42 @@ def suggest_category(keyword: str, title: str) -> str:
             return cat
     return "업계동향"
 
+def extract_article_summary(url: str, max_chars: int = 150) -> str:
+    """
+    기사 URL에서 본문 추출 후 요약
+    - trafilatura 사용 (신문 기사 최적화)
+    - 실패 시 빈 문자열 반환
+    """
+    if not trafilatura:
+        return ""
+
+    try:
+        # 타임아웃 짧게 (1개 기사만 처리하므로)
+        response = requests.get(url, timeout=8, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'
+        })
+        if response.status_code != 200:
+            return ""
+
+        # trafilatura로 본문 추출
+        extracted_text = trafilatura.extract(response.text, include_comments=False)
+        if not extracted_text:
+            return ""
+
+        # 첫 문장만 추출 (마침표 기준)
+        match = re.search(r'[^.!?\n]*[.!?]', extracted_text)
+        if match:
+            summary = match.group(0)[:max_chars]
+        else:
+            summary = extracted_text[:max_chars]
+
+        return summary.strip()
+
+    except requests.exceptions.Timeout:
+        return ""
+    except Exception:
+        return ""
+
 def build_mail_html(sel_df):
     """메일용 HTML 생성"""
     FF = "'맑은 고딕','Malgun Gothic',sans-serif"
@@ -536,10 +577,28 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
     if st.button("📋 메일 본문 생성", type="primary", use_container_width=True,
                  disabled=sel.empty):
+        # 원문 크롤링으로 요약 생성
+        with st.spinner("기사 본문에서 요약 추출 중..."):
+            prog = st.progress(0, text="크롤링 중... (0/0)")
+            for idx, (i, row) in enumerate(sel.iterrows()):
+                prog.progress(
+                    (idx + 1) / len(sel),
+                    text=f"크롤링 중... ({idx + 1}/{len(sel)})"
+                )
+                url = row.get("링크", "")
+                if url and not row.get("요약", "").strip():
+                    # 요약이 비어있으면 크롤링해서 채우기
+                    summary = extract_article_summary(url)
+                    if summary:
+                        sel.loc[i, "요약"] = summary
+                time.sleep(0.3)  # 서버 부하 방지
+            prog.empty()
+
         sel["_c"] = sel["메일카테고리"].map({c: i for i, c in enumerate(MAIL_CATEGORIES)})
         sel = sel.sort_values(["_c", "발행시각"], ascending=[True, False])
         mail_html = build_mail_html(sel)
         st.session_state["mail_html"] = mail_html
+        st.success("✅ 메일 본문이 생성되었습니다.")
 
     if "mail_html" in st.session_state:
         st.subheader("메일 본문")
