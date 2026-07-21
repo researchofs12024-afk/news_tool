@@ -468,8 +468,7 @@ def suggest_category(keyword: str, title: str) -> str:
 
 def extract_text_with_bs4(url: str) -> str:
     """
-    BeautifulSoup으로 HTML에서 본문 텍스트만 추출 (한국 뉴스 최적화)
-    메뉴, 광고, 카테고리 등 제거
+    BeautifulSoup으로 HTML에서 본문만 추출 (이미지 캡션, 메뉴 제거)
     """
     if not BS_AVAILABLE:
         return ""
@@ -483,16 +482,18 @@ def extract_text_with_bs4(url: str) -> str:
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # 스크립트, 스타일, 네비게이션, 광고 제거
-        for selector in ['script', 'style', 'nav', '.nav', '.menu', '.ad', '.advertisement',
-                         '.comment', '.related', '.sidebar', 'footer']:
+        # 불필요한 요소 제거
+        for selector in ['script', 'style', 'nav', 'footer', '.nav', '.menu', '.ad',
+                         '.advertisement', '.comment', '.related', '.sidebar', '.social',
+                         'figure', '.figure', '.caption', '.photo-caption']:
             for element in soup.select(selector):
                 element.decompose()
 
-        # 주요 텍스트 컨테이너 찾기 (한국 뉴스사이트)
+        # 본문 컨테이너 찾기
         article_body = None
         selectors = [
             'article',
+            '#content',
             '.article-body',
             '.news-body',
             '#article-view-content-div',
@@ -501,7 +502,6 @@ def extract_text_with_bs4(url: str) -> str:
             '.articleText',
             '.news-content',
             '.entry-content',
-            '.post-content',
             'main'
         ]
 
@@ -511,31 +511,47 @@ def extract_text_with_bs4(url: str) -> str:
                 break
 
         if article_body:
-            text = article_body.get_text()
-        else:
-            # 폴백: 가장 큰 텍스트 블록 찾기
-            paragraphs = soup.find_all(['p', 'div'], class_=re.compile(r'(article|content|body|text)', re.I))
+            # <p> 태그에서만 텍스트 추출 (본문 문단)
+            paragraphs = article_body.find_all('p')
             if paragraphs:
-                text = ' '.join([p.get_text() for p in paragraphs[:10]])
+                text_lines = []
+                for p in paragraphs:
+                    p_text = p.get_text().strip()
+                    # 이미지 캡션 제거 (▲, 사진=, 영상=, 출처= 등으로 시작)
+                    if not re.match(r'^[▲◀▶★●○□■▼)(사진|영상|출처|자료|제공|보도|기자|글|사진=|영상=|출처=)', p_text):
+                        text_lines.append(p_text)
+                text = ' '.join(text_lines)
             else:
-                text = soup.get_text()
+                text = article_body.get_text()
+        else:
+            text = soup.get_text()
 
-        # 공백 정리 및 중복 제거
+        # 줄 단위 정리
         lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-        # 너무 짧은 줄 제거 (메뉴, 카테고리 등)
-        lines = [line for line in lines if len(line) > 10]
+        # 캡션, 메뉴 패턴 제거
+        filtered_lines = []
+        for line in lines:
+            # 너무 짧은 줄 제거
+            if len(line) < 10:
+                continue
+            # 이미지/영상 캡션 제거
+            if re.match(r'^[▲◀▶★●○□■\()(사진|영상|출처|자료|제공|보도|기자)', line):
+                continue
+            # "방문객들이 ~을 보고 있다" 같은 캡션 제거
+            if re.search(r'(둘러보|보며|들이.*보).*있다', line) and len(line) < 50:
+                continue
+            filtered_lines.append(line)
 
-        text = ' '.join(lines)
+        text = ' '.join(filtered_lines)
 
         # 공백 정리
         text = re.sub(r'\s+', ' ', text).strip()
 
-        # 너무 짧으면 빈 문자열 반환
-        if len(text) < 100:
+        if len(text) < 150:
             return ""
 
-        return text[:2500]  # 처음 2500글자
+        return text[:2500]
 
     except Exception:
         return ""
@@ -553,15 +569,17 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str) -> str:
         model = genai.GenerativeModel('gemini-1.5-flash')
 
         response = model.generate_content(
-            f"""다음 뉴스 기사의 핵심을 명사형으로 끝나는 한 줄 헤드라인 (최대 100글자)으로 요약해줘.
+            f"""뉴스 기사 헤드라인 작성 (명사형 필수)
 
-요구사항:
-- 명사형 어조로 끝낼 것 (예: '~추진', '~확정', '~결정', '~완료' 등)
-- 주체(회사/기관명)와 핵심 내용을 명확히 포함
-- 숫자나 수치는 간결하게
+반드시 지킬 규칙:
+1. 명사형 종결 (추진, 확정, 결정, 완료, 진행, 개시 등)
+2. "~한다" "~했다" 동사형 금지
+3. 기업/기관명 + 핵심 내용
+4. 최대 100글자
+5. 헤드라인만 출력
 
-기사 내용:
-{article_text[:2000]}
+기사:
+{article_text[:2500]}
 
 헤드라인:"""
         )
