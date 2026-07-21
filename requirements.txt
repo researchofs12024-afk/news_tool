@@ -3,4 +3,5 @@ requests
 feedparser
 pandas
 openpyxl
+newspaper3k
 trafilatura
