@@ -6,3 +6,4 @@ openpyxl
 newspaper3k
 trafilatura
 google-generativeai
+beautifulsoup4
