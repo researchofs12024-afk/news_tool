@@ -26,19 +26,8 @@ try:
 except ImportError:
     trafilatura = None
 
-# Gemini: 신규 패키지(google-genai) 우선, 없으면 구 패키지(google-generativeai)
-GEMINI_MODE = None
-try:
-    from google import genai as genai_new
-    GEMINI_MODE = "new"
-    GEMINI_AVAILABLE = True
-except ImportError:
-    try:
-        import google.generativeai as genai
-        GEMINI_MODE = "old"
-        GEMINI_AVAILABLE = True
-    except ImportError:
-        GEMINI_AVAILABLE = False
+# Gemini는 SDK 대신 REST API 직접 호출 (AQ. 신형 키 호환)
+GEMINI_AVAILABLE = True
 
 try:
     from bs4 import BeautifulSoup
@@ -358,12 +347,7 @@ with st.sidebar:
     if gemini_key:
         use_gemini = st.checkbox("Google Gemini AI로 요약", value=True,
                                 help="✓ API 키 설정됨")
-        st.caption(f"✓ Gemini 준비 완료 (패키지: {GEMINI_MODE})")
-        # API 키 형식 검증 (정상 키는 AIza로 시작)
-        if not gemini_key.startswith("AIza"):
-            st.error("⚠️ API 키 형식이 이상합니다. Google AI Studio API 키는 보통 "
-                     "`AIza`로 시작합니다. https://aistudio.google.com/app/apikey 에서 "
-                     "발급한 키가 맞는지 확인하세요. (현재 키로는 요약이 실패할 수 있음)")
+        st.caption("✓ Gemini 준비 완료 (REST API 직접 호출)")
     else:
         use_gemini = False
         st.warning("⚠️ GEMINI_API_KEY가 설정되지 않았습니다.\n앱 Settings → Secrets에 키를 추가하세요.")
@@ -585,52 +569,50 @@ GEMINI_PROMPT = """뉴스 기사 헤드라인 작성 (명사형 필수)
 헤드라인:"""
 
 # 최신 모델 우선, 실패 시 순차 폴백
-GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"]
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
 
 
 def generate_summary_with_gemini(article_text: str, gemini_key: str):
     """
-    Gemini API로 명사형 헤드라인 요약 생성
+    Gemini REST API 직접 호출로 명사형 헤드라인 요약 생성.
+    SDK를 거치지 않고 x-goog-api-key 헤더로 키 전달 → AQ. 신형 키 호환.
     반환: (요약문 or "", 에러메시지 or None)
     """
-    if not GEMINI_AVAILABLE or not gemini_key or not article_text:
-        return "", "라이브러리/키/텍스트 없음"
+    if not gemini_key or not article_text:
+        return "", "키/텍스트 없음"
 
     prompt = GEMINI_PROMPT.format(text=article_text[:2500])
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": gemini_key,  # SDK 우회: 헤더로 직접 전달
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3},
+    }
+
     last_error = None
-
-    # 신규 패키지 (google-genai)
-    if GEMINI_MODE == "new":
+    for model_name in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
-            client = genai_new.Client(api_key=gemini_key)
-            for model_name in GEMINI_MODELS:
-                try:
-                    resp = client.models.generate_content(model=model_name, contents=prompt)
-                    summary = (resp.text or "").strip()
-                    if summary and len(summary) > 5:
-                        return summary[:150], None
-                except Exception as e:
-                    last_error = f"{model_name}: {str(e)[:120]}"
-                    continue
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
+            if r.status_code != 200:
+                last_error = f"{model_name} HTTP {r.status_code}: {r.text[:120]}"
+                continue
+            data = r.json()
+            # 응답 파싱
+            candidates = data.get("candidates", [])
+            if not candidates:
+                last_error = f"{model_name}: 응답 후보 없음 {str(data)[:100]}"
+                continue
+            parts = candidates[0].get("content", {}).get("parts", [])
+            summary = "".join(p.get("text", "") for p in parts).strip()
+            if summary and len(summary) > 5:
+                return summary[:150], None
+            last_error = f"{model_name}: 빈 응답"
         except Exception as e:
-            return "", f"클라이언트 생성 실패: {str(e)[:120]}"
-
-    # 구 패키지 (google-generativeai)
-    elif GEMINI_MODE == "old":
-        try:
-            genai.configure(api_key=gemini_key)
-            for model_name in GEMINI_MODELS:
-                try:
-                    model = genai.GenerativeModel(model_name)
-                    resp = model.generate_content(prompt)
-                    summary = resp.text.strip()
-                    if summary and len(summary) > 5:
-                        return summary[:150], None
-                except Exception as e:
-                    last_error = f"{model_name}: {str(e)[:120]}"
-                    continue
-        except Exception as e:
-            return "", f"configure 실패: {str(e)[:120]}"
+            last_error = f"{model_name}: {str(e)[:120]}"
+            continue
 
     return "", last_error or "모든 모델 실패"
 
