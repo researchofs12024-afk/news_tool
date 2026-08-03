@@ -512,14 +512,81 @@ def resolve_press(final_url: str, raw_html: str = "") -> str:
     return press_fallback_from_url(final_url)
 
 
+# ── 원문 제목 추출 ────────────────────────────────────────────
+TRUNC_RE = re.compile(r"(\.\.\.+|…+|‥+)\s*$")
+TITLE_TAIL_SEPS = (" - ", " | ", " < ", " :: ", " > ", " – ", " — ")
+
+
+def _clean_title(t: str) -> str:
+    if not t:
+        return ""
+    t = re.sub(r"\s+", " ", html.unescape(str(t))).strip().strip("\"'“”‘’")
+    return t[:200] if len(t) >= 8 else ""
+
+
+def title_from_html(soup) -> str:
+    """og:title → twitter:title → h1 → <title> 순으로 기사 원문 제목 추출."""
+    for sel, attr in [('meta[property="og:title"]', "content"),
+                      ('meta[name="twitter:title"]', "content"),
+                      ('meta[name="title"]', "content")]:
+        tag = soup.select_one(sel)
+        if tag:
+            v = _clean_title(tag.get(attr, ""))
+            if v and not TRUNC_RE.search(v):
+                return v
+
+    for sel in ("h1.headline", "h1#title", "h1", ".article-head-title", "#articleTitle"):
+        tag = soup.select_one(sel)
+        if tag:
+            v = _clean_title(tag.get_text())
+            if v and not TRUNC_RE.search(v):
+                return v
+
+    try:
+        raw = soup.title.string if soup.title else ""
+    except Exception:
+        raw = ""
+    v = _clean_title(raw)
+    for sep in TITLE_TAIL_SEPS:          # "제목 - 언론사" 꼬리표 제거
+        if sep in v:
+            head = v.rsplit(sep, 1)[0].strip()
+            if len(head) >= 10:
+                v = head
+                break
+    return "" if TRUNC_RE.search(v) else v
+
+
+def better_title(current: str, crawled: str) -> str:
+    """네이버 제목이 잘려 있으면 원문 제목으로 교체."""
+    cur = (current or "").strip()
+    new = (crawled or "").strip()
+    if not new or new == cur:
+        return cur
+    if not cur:
+        return new
+
+    core = TRUNC_RE.sub("", cur).strip()
+    if len(core) < 6:
+        return cur
+    same_article = new.startswith(core[:12]) or core[:12] in new
+
+    if TRUNC_RE.search(cur) and len(new) > len(core):
+        return new                       # 명백히 잘린 제목
+    if same_article and len(new) > len(cur) + 4:
+        return new                       # 같은 기사인데 원문이 더 김
+    return cur
+
+
 # ── 본문 파싱 ────────────────────────────────────────────────
 def parse_body_with_bs4(raw_html: str):
-    """반환: (본문, 언론사)"""
+    """반환: (본문, 언론사, 원문제목)"""
     if not BS_AVAILABLE or not raw_html:
-        return "", ""
+        return "", "", ""
     try:
         soup = BeautifulSoup(raw_html, "html.parser")
-        press = press_from_html(soup)  # decompose 전에 먼저 추출
+        # decompose 전에 먼저 추출 (h1/header가 제거 대상에 포함되므로)
+        press = press_from_html(soup)
+        page_title = title_from_html(soup)
 
         for selector in DROP_SELECTORS:
             for el in soup.select(selector):
@@ -539,9 +606,9 @@ def parse_body_with_bs4(raw_html: str):
             lines = target.get_text("\n").split("\n")
 
         text = re.sub(r"\s+", " ", " ".join(_clean_paragraphs(lines))).strip()
-        return (text[:2500] if len(text) >= 150 else ""), press
+        return (text[:2500] if len(text) >= 150 else ""), press, page_title
     except Exception:
-        return "", ""
+        return "", "", ""
 
 
 def parse_body_with_trafilatura(raw_html: str) -> str:
@@ -578,15 +645,15 @@ def extract_text_with_newspaper(url: str, timeout: int = 8) -> str:
 
 def fetch_article(url: str):
     """
-    링크 정규화 → HTML 1회 수집 → 3단계 폴백 본문 추출 + 언론사 판별.
-    반환: (본문, 사용된추출기, 최종URL, 언론사)
+    링크 정규화 → HTML 1회 수집 → 3단계 폴백 본문 추출 + 언론사·원문제목 판별.
+    반환: (본문, 사용된추출기, 최종URL, 언론사, 원문제목)
     """
     final_url = normalize_article_url(url)
-    text, press, extractor = "", "", "실패"
+    text, press, page_title, extractor = "", "", "", "실패"
 
     raw = fetch_html(final_url)
     if raw:
-        text, press = parse_body_with_bs4(raw)
+        text, press, page_title = parse_body_with_bs4(raw)
         if text:
             extractor = "bs4"
         else:
@@ -603,21 +670,13 @@ def fetch_article(url: str):
     if not text and final_url != url:
         raw2 = fetch_html(url)
         if raw2:
-            text, p2 = parse_body_with_bs4(raw2)
+            text, p2, t2 = parse_body_with_bs4(raw2)
             press = press or p2
+            page_title = page_title or t2
             if text:
                 extractor, final_url = "bs4(원본)", url
 
-    return text, extractor, final_url, resolve_press(final_url, raw)
-
-
-def detect_press_only(row_idx, url):
-    """요약 없이 언론사만 빠르게 판별 (워커)."""
-    final_url = normalize_article_url(url)
-    mapped = press_from_link(final_url)
-    if mapped != PRESS_PLACEHOLDER:
-        return row_idx, mapped
-    return row_idx, resolve_press(final_url, fetch_html(final_url))
+    return text, extractor, final_url, resolve_press(final_url, raw), page_title
 
 
 def first_sentence(text: str, max_chars: int = 150) -> str:
@@ -912,18 +971,22 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
 
 
 def summarize_one(row_idx, url, gemini_key, picker, use_ai):
-    """워커: 본문 추출 + 언론사 판별 + 요약 생성. 반환: (idx, 요약, 언론사, 로그)"""
-    text, extractor, final_url, press = fetch_article(url)
+    """
+    워커: 본문 추출 + 언론사·원문제목 판별 + 요약 생성.
+    반환: (idx, 요약, 언론사, 원문제목, 로그)
+    """
+    text, extractor, final_url, press, page_title = fetch_article(url)
     if not text:
-        return row_idx, "", press, f"본문 추출 실패 → {final_url[:70]}"
+        return row_idx, "", press, page_title, f"본문 추출 실패 → {final_url[:70]}"
 
     if not use_ai:
-        return row_idx, first_sentence(text), press, None
+        return row_idx, first_sentence(text), press, page_title, None
 
     summary, err = generate_summary_with_gemini(text, gemini_key, picker)
     if summary:
-        return row_idx, summary, press, None
-    return row_idx, first_sentence(text), press, f"[Gemini실패/{extractor}] {err}"
+        return row_idx, summary, press, page_title, None
+    return row_idx, first_sentence(text), press, page_title, \
+        f"[Gemini실패/{extractor}] {err}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -989,7 +1052,7 @@ with st.sidebar:
         use_gemini = st.checkbox("Gemini로 요약", value=True)
 
         if st.button("🔌 모델 목록 새로고침 / 연결 테스트", **FULL_W):
-            for k in ("_gemini_model_list", "_gemini_model", "_gemini_dead"):
+            for k in ("_gemini_model_list", "_gemini_model"):
                 st.session_state.pop(k, None)
             models, err = list_gemini_models(gemini_key)
             if models:
@@ -1008,11 +1071,6 @@ with st.sidebar:
         elif cerr:
             st.caption(f"⚠️ {cerr}")
 
-        dead = st.session_state.get("_gemini_dead") or {}
-        if dead:
-            with st.expander(f"🚫 사용 불가 판정 모델 {len(dead)}개"):
-                for m, why in dead.items():
-                    st.text(f"{m}\n  └ {why[:110]}")
     else:
         use_gemini = False
         st.warning("⚠️ GEMINI_API_KEY 미설정\n\n"
@@ -1233,43 +1291,11 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     if not sel.empty:
         need_press = sel[sel["언론사"].astype(str).str.strip().isin(["", PRESS_PLACEHOLDER])]
         if not need_press.empty:
-            st.warning(f"⚠️ 선택한 기사 중 {len(need_press)}건은 언론사가 비어 있습니다. "
-                       "아래 [언론사 자동 채우기]를 누르세요.")
+            st.caption(f"ℹ️ 선택한 기사 중 {len(need_press)}건은 언론사가 비어 있습니다. "
+                       "메일 본문 생성 시 자동으로 채워집니다.")
 
-    bc1, bc2 = st.columns([1, 2])
-    with bc1:
-        fill_press = st.button("🏢 언론사 자동 채우기", **FULL_W,
-                               disabled=sel.empty,
-                               help="선택한 기사의 페이지를 열어 언론사명을 판별합니다 (요약 없이 빠름)")
-    with bc2:
-        make_mail = st.button("📋 메일 본문 생성", type="primary",
-                              **FULL_W, disabled=sel.empty)
-
-    if fill_press:
-        prog = st.progress(0.0, text="언론사 판별 중...")
-        updates = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(detect_press_only, i, str(r.get("링크", "")))
-                       for i, r in sel.iterrows() if str(r.get("링크", ""))]
-            for n, fut in enumerate(as_completed(futures), start=1):
-                try:
-                    idx, press = fut.result()
-                    if press:
-                        updates[idx] = press
-                except Exception:
-                    pass
-                prog.progress(n / max(len(futures), 1),
-                              text=f"언론사 판별 중... ({n}/{len(futures)})")
-        prog.empty()
-
-        new_df = edited_df.copy()  # 사용자의 선택·수정 내용 그대로 승계
-        for idx, press in updates.items():
-            new_df.loc[idx, "언론사"] = press
-        st.session_state["editor_df"] = new_df
-        st.session_state.pop("editor", None)
-        st.session_state["_flash"] = True
-        st.session_state["_flash_msg"] = f"✅ 언론사 {len(updates)}건 판별 완료"
-        st.rerun()
+    make_mail = st.button("📋 메일 본문 생성", type="primary",
+                          **FULL_W, disabled=sel.empty)
 
     if make_mail:
         use_ai = bool(use_gemini and gemini_key)
@@ -1290,7 +1316,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         sel_copy = sel.copy()  # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
-        logs, ok, press_filled = [], 0, 0
+        logs, ok, press_filled, title_fixed = [], 0, 0, 0
         total_n = len(sel_copy)
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1301,7 +1327,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             ]
             for n, fut in enumerate(as_completed(futures), start=1):
                 try:
-                    idx, summary, press, log = fut.result()
+                    idx, summary, press, page_title, log = fut.result()
                     if summary:
                         sel_copy.loc[idx, "요약"] = summary
                         if log is None:
@@ -1310,6 +1336,12 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                     if press and cur in ("", PRESS_PLACEHOLDER, "nan"):
                         sel_copy.loc[idx, "언론사"] = press
                         press_filled += 1
+                    # 네이버 제목이 잘려 있으면 기사 원문 제목으로 교체
+                    cur_title = str(sel_copy.loc[idx, "제목"])
+                    fixed = better_title(cur_title, page_title)
+                    if fixed != cur_title:
+                        sel_copy.loc[idx, "제목"] = fixed
+                        title_fixed += 1
                     if log:
                         logs.append(log)
                 except Exception as e:
@@ -1319,36 +1351,13 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         label = "Gemini 요약" if use_ai else "첫 문장 요약"
         st.write(f"**결과:** ✓ {ok}/{total_n}건 {label} 성공"
-                 + (f" · 언론사 {press_filled}건 자동 보완" if press_filled else ""))
-
-        if picker is not None:
-            if picker.dead:
-                st.session_state["_gemini_dead"] = dict(picker.dead)
-                st.warning(f"🚫 사용 불가 모델 {len(picker.dead)}개를 건너뛰었습니다 → "
-                           f"실제 사용: `{picker.current() or '없음'}`")
-                with st.expander("건너뛴 모델"):
-                    for m, why in picker.dead.items():
-                        st.text(f"{m}\n  └ {why[:140]}")
-            if picker.current():
-                st.session_state["_gemini_model"] = picker.current()
+                 + (f" · 언론사 {press_filled}건 보완" if press_filled else "")
+                 + (f" · 잘린 제목 {title_fixed}건 원문으로 복원" if title_fixed else ""))
 
         still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
         if not still_empty.empty:
             st.warning(f"⚠️ 언론사 미확인 {len(still_empty)}건 — 아래 표에서 직접 입력하세요.")
-
-        # 표는 제목이 잘리므로 전문 그대로 노출
-        with st.expander("🏢 언론사·제목·요약 전문 확인", expanded=True):
-            for _, r in sel_copy.iterrows():
-                st.markdown(f"**[{r['제목']}]({r['링크']})**")
-                for ln in str(r.get("요약", "") or "").split("\n"):
-                    if ln.strip():
-                        st.markdown(
-                            f"<div style='margin:0 0 2px 6px'>{html.escape(ln.strip())}</div>",
-                            unsafe_allow_html=True)
-                st.caption(f"{r.get('언론사', '')} · {r.get('메일카테고리', '')} · "
-                           f"{r.get('발행시각', '')}")
-                st.divider()
 
         if logs:
             st.warning(f"⚠️ {len(logs)}건 문제 발생 (첫 문장으로 대체됨)")
@@ -1367,6 +1376,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         for idx in sel_copy.index:
             back.loc[idx, "요약"] = sel_copy.loc[idx, "요약"]
             back.loc[idx, "언론사"] = sel_copy.loc[idx, "언론사"]
+            back.loc[idx, "제목"] = sel_copy.loc[idx, "제목"]
         st.session_state["editor_df"] = back
 
         st.success("✅ 메일 본문이 생성되었습니다. (편집표에도 반영됨)")
