@@ -49,6 +49,8 @@ UA_HEADERS = {
         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://search.naver.com/",
 }
 
 DEFAULT_KEYWORDS = {
@@ -142,6 +144,12 @@ PRESS_DOMAIN_MAP = {
     "fntimes.com": "한국금융신문", "insightkorea.co.kr": "인사이트코리아",
     "sisaon.co.kr": "시사오늘", "ekn.kr": "에너지경제", "m-i.kr": "매일일보",
     "smarttoday.co.kr": "스마트투데이", "newsprime.co.kr": "프라임경제",
+    "etoday.co.kr": "이투데이", "cfnews.kr": "CF뉴스", "huffingtonpost.kr": "허프포스트코리아",
+    "shinailbo.co.kr": "신아일보", "ajunews.kr": "아주경제", "dailian.co.kr": "데일리안",
+    "nocutnews.co.kr": "노컷뉴스", "ytn.co.kr": "YTN", "sbs.co.kr": "SBS", "kbs.co.kr": "KBS",
+    "imbc.com": "MBC", "jtbc.co.kr": "JTBC", "mbn.co.kr": "MBN", "hankyung.com/realestate": "한국경제",
+    "biz.heraldcorp.com": "헤럴드경제", "news.mt.co.kr": "머니투데이", "b.mk.co.kr": "매일경제",
+    "koreaherald.com": "코리아헤럴드", "kedglobal.com": "KED Global", "pulse.mk.co.kr": "매일경제",
 }
 
 
@@ -639,6 +647,27 @@ def better_title(current: str, crawled: str) -> str:
 
 
 # ── 본문 파싱 ────────────────────────────────────────────────
+MIN_BODY_LEN = 120
+
+
+def _largest_text_container(soup):
+    """
+    알려진 셀렉터가 하나도 안 맞는 언론사(이투데이 등) 대응.
+    <p> 텍스트가 가장 많고 링크 비중이 낮은 블록을 본문으로 추정.
+    """
+    best, best_score = None, 0
+    for el in soup.find_all(["article", "div", "section"]):
+        ps = el.find_all("p")
+        if len(ps) < 2:
+            continue
+        txt = sum(len(p.get_text(strip=True)) for p in ps)
+        links = sum(len(a.get_text(strip=True)) for a in el.find_all("a"))
+        score = txt - 3 * links          # 메뉴·관련기사 블록 배제
+        if score > best_score:
+            best, best_score = el, score
+    return best if best_score >= 200 else None
+
+
 def parse_body_with_bs4(raw_html: str):
     """반환: (본문, 언론사, 원문제목)"""
     if not BS_AVAILABLE or not raw_html:
@@ -659,6 +688,9 @@ def parse_body_with_bs4(raw_html: str):
             if body:
                 break
 
+        if body is None:                     # 알려진 셀렉터가 없는 CMS 대응
+            body = _largest_text_container(soup)
+
         target = body if body is not None else soup
         paragraphs = target.find_all("p")
         if paragraphs and len(" ".join(p.get_text() for p in paragraphs)) > 200:
@@ -667,7 +699,7 @@ def parse_body_with_bs4(raw_html: str):
             lines = target.get_text("\n").split("\n")
 
         text = re.sub(r"\s+", " ", " ".join(_clean_paragraphs(lines))).strip()
-        return (text[:2500] if len(text) >= 150 else ""), press, page_title
+        return (text[:2500] if len(text) >= MIN_BODY_LEN else ""), press, page_title
     except Exception:
         return "", "", ""
 
@@ -680,7 +712,7 @@ def parse_body_with_trafilatura(raw_html: str) -> str:
         if not text:
             return ""
         text = re.sub(r"\s+", " ", " ".join(_clean_paragraphs(text.split("\n")))).strip()
-        return text[:2500] if len(text) >= 150 else ""
+        return text[:2500] if len(text) >= MIN_BODY_LEN else ""
     except Exception:
         return ""
 
@@ -699,7 +731,7 @@ def extract_text_with_newspaper(url: str, timeout: int = 8) -> str:
         article.parse()
         text = " ".join(_clean_paragraphs((article.text or "").split("\n")))
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:2500] if len(text) >= 150 else ""
+        return text[:2500] if len(text) >= MIN_BODY_LEN else ""
     except Exception:
         return ""
 
@@ -1348,8 +1380,8 @@ def build_mail_html(sel_df):
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
-    st.caption("배포할 기사의 **행 아무 곳이나 클릭**하면 선택됩니다 "
-               "(여러 건 연속 클릭 가능, 다시 클릭하면 해제). "
+    st.caption("맨 왼쪽 **체크박스 칸**을 누르거나 행의 **아무 칸이나 클릭**하면 선택됩니다. "
+               "머리글의 체크박스로 전체 선택/해제. "
                "분류와 요약은 [메일 본문 생성] 시 AI가 기사 내용을 읽고 채웁니다.")
 
     base = st.session_state["collected"].copy()
@@ -1371,22 +1403,13 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
     work_df = st.session_state["editor_df"]
 
-    ac1, ac2, _ = st.columns([1, 1, 3])
-    if ac1.button("전체 선택", **FULL_W):
-        st.session_state["picked_rows"] = list(range(len(work_df)))
-        st.session_state.pop("picker_table", None)
-        st.rerun()
-    if ac2.button("전체 해제", **FULL_W):
-        st.session_state["picked_rows"] = []
-        st.session_state.pop("picker_table", None)
-        st.rerun()
-
     event = st.dataframe(
         work_df,
         hide_index=True, **FULL_W, height=460,
         key="picker_table",
         on_select="rerun",
-        selection_mode="multi-row",
+        # multi-row: 왼쪽 체크박스 열 / multi-cell: 본문 칸 클릭으로도 행 선택
+        selection_mode=["multi-row", "multi-cell"],
         selection_default={"selection": {
             "rows": st.session_state.get("picked_rows", []),
             "columns": [], "cells": []}},
@@ -1403,7 +1426,14 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         },
     )
 
-    picked = list(getattr(event, "selection", {}).get("rows", []))
+    selstate = getattr(event, "selection", {}) or {}
+    rows = set(selstate.get("rows") or [])
+    for cell in (selstate.get("cells") or []):      # 칸 클릭도 행 선택으로 인정
+        try:
+            rows.add(int(cell[0]))
+        except Exception:
+            pass
+    picked = sorted(r for r in rows if 0 <= r < len(work_df))
     st.session_state["picked_rows"] = picked
     sel = work_df.iloc[picked].copy() if picked else work_df.iloc[0:0].copy()
 
@@ -1462,6 +1492,11 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                     if fixed != cur_title:
                         sel_copy.loc[idx, "제목"] = fixed
                         title_fixed += 1
+                    # 크롤링·요약이 모두 실패해도 빈칸으로 두지 않는다
+                    if not str(sel_copy.loc[idx, "요약"] or "").strip():
+                        fb = first_sentence(str(sel_copy.loc[idx, "요약초안"] or ""), 90)
+                        if fb:
+                            sel_copy.loc[idx, "요약"] = fb
                     if log:
                         logs.append(log)
                 except Exception as e:
@@ -1478,7 +1513,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
         if not still_empty.empty:
-            st.warning(f"⚠️ 언론사 미확인 {len(still_empty)}건 — 아래 표에서 직접 입력하세요.")
+            st.warning(f"⚠️ 언론사 미확인 {len(still_empty)}건 — 메일 본문에서 직접 수정하세요.")
 
         if logs:
             st.warning(f"⚠️ {len(logs)}건 문제 발생 (첫 문장으로 대체됨)")
@@ -1492,41 +1527,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             for col in ("요약", "언론사", "제목", "메일카테고리"):
                 back.loc[idx, col] = sel_copy.loc[idx, col]
         st.session_state["editor_df"] = back
-        st.session_state["result_df"] = sel_copy
         st.session_state["mail_html"] = build_mail_html(sort_for_mail(sel_copy))
-        st.session_state.pop("refine", None)
         st.success("✅ 메일 본문이 생성되었습니다.")
-
-    # ── 생성 결과 다듬기 ─────────────────────────────────────
-    if "result_df" in st.session_state and not st.session_state["result_df"].empty:
-        st.subheader("생성 결과 다듬기")
-        st.caption("분류·요약·언론사를 직접 고친 뒤 [메일 본문 다시 만들기]를 누르세요.")
-
-        refined = st.data_editor(
-            st.session_state["result_df"],
-            hide_index=True, **FULL_W, height=340,
-            column_order=["메일카테고리", "제목", "요약", "언론사", "링크"],
-            column_config={
-                "메일카테고리": st.column_config.SelectboxColumn(
-                    "분류", options=MAIL_CATEGORIES, width=col_width(110, "small")),
-                "제목": st.column_config.TextColumn("제목", width=col_width(430)),
-                "요약": st.column_config.TextColumn("요약", width=col_width(430)),
-                "언론사": st.column_config.TextColumn("언론사", width=col_width(120, "small")),
-                "링크": st.column_config.LinkColumn("링크", display_text="열기",
-                                                  width=col_width(70, "small")),
-                "요약초안": None, "카테고리": None, "네이버링크": None,
-                "키워드": None, "발행시각": None,
-            },
-            disabled=["링크"],
-            key="refine",
-        )
-
-        if st.button("🔁 메일 본문 다시 만들기", **FULL_W):
-            st.session_state["result_df"] = refined
-            st.session_state["mail_html"] = build_mail_html(sort_for_mail(refined))
-            st.session_state["_flash"] = True
-            st.session_state["_flash_msg"] = "✅ 메일 본문을 다시 만들었습니다."
-            st.rerun()
 
     if "mail_html" in st.session_state:
         st.subheader("메일 본문")
