@@ -728,6 +728,20 @@ def first_sentence(text: str, max_chars: int = 150) -> str:
     return (m.group(0) if m else text[:max_chars].rstrip() + ".")[:max_chars].strip()
 
 
+def naver_fallback_summary(desc: str, max_chars: int = 90) -> str:
+    """
+    본문 크롤링이 막힌 매체(더벨·인베스트조선 등) 대비.
+    네이버 검색 API가 함께 주는 요약문을 정리해 사용한다.
+    """
+    t = re.sub(r"\s+", " ", str(desc or "")).strip()
+    if not t:
+        return ""
+    t = TRUNC_RE.sub("", t).strip()      # 끝의 '...' 제거
+    if len(t) < 12:
+        return ""
+    return first_sentence(t, max_chars)
+
+
 # ══════════════════════════════════════════════════════════════
 # Gemini (REST 직접 호출)
 # ══════════════════════════════════════════════════════════════
@@ -1417,7 +1431,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         sel_copy = sel.copy()   # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
-        logs, ok, press_filled, title_fixed, cat_ai = [], 0, 0, 0, 0
+        logs, ok, press_filled, title_fixed, cat_ai, naver_fb = [], 0, 0, 0, 0, 0
         total_n = len(sel_copy)
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1448,6 +1462,14 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                     if fixed != cur_title:
                         sel_copy.loc[idx, "제목"] = fixed
                         title_fixed += 1
+                    # 크롤링이 막힌 매체 → 네이버 검색 요약문으로 대체 (빈칸 방지)
+                    if not str(sel_copy.loc[idx, "요약"] or "").strip():
+                        fb = naver_fallback_summary(sel_copy.loc[idx, "요약초안"])
+                        if fb:
+                            sel_copy.loc[idx, "요약"] = fb
+                            naver_fb += 1
+                            if log:
+                                log += " → 네이버 요약문으로 대체"
                     if log:
                         logs.append(log)
                 except Exception as e:
@@ -1471,7 +1493,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         st.write(f"**결과:** ✓ {ok}/{total_n}건 {label} 성공"
                  + (f" · 분류 {cat_ai}건 AI 재조정" if cat_ai else "")
                  + (f" · 언론사 {press_filled}건 보완" if press_filled else "")
-                 + (f" · 잘린 제목 {title_fixed}건 복원" if title_fixed else ""))
+                 + (f" · 잘린 제목 {title_fixed}건 복원" if title_fixed else "")
+                 + (f" · 크롤링 차단 {naver_fb}건은 네이버 요약문 사용" if naver_fb else ""))
 
         still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
