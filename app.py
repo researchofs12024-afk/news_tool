@@ -963,9 +963,11 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
         if r.status_code == 429:
             body = re.sub(r"\s+", " ", r.text)
             reason, per_day = _quota_reason(body)
-            if per_day:      # 일일 한도는 기다려도 안 풀린다
-                return "", (f"{model_name}: 429 {reason} — 오늘 무료 사용량 소진. "
-                            f"내일 초기화되거나 결제 연결 필요"), False
+            # 일일 한도는 기다려도 안 풀린다. 단 모델별로 따로 집계되므로
+            # 이 모델만 폐기 처리하고 다음 후보 모델로 넘긴다.
+            if per_day:
+                return "", (f"{model_name}: 오늘 무료 일일 한도 소진 ({reason}) "
+                            f"→ 다른 모델로 전환"), True
             m = RETRY_DELAY_RE.search(body)
             delay = min(float(m.group(1)) if m else 8 * (attempt + 1), 60)
             last_err = (f"{model_name}: 429 {reason} · "
