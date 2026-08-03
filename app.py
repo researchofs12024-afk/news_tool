@@ -776,6 +776,22 @@ GEMINI_PROMPT = """아래 기사를 부동산 업계용 '기사 상단 요약'�
 
 STRICT_SUFFIX = "\n\n(직전 답변에 서술형 어미가 있었다. 모든 줄을 명사로 끝내라.)"
 
+GEMINI_SHORT_PROMPT = """아래는 기사 전문이 아니라 검색 결과에 노출된 짧은 발췌문이다.
+제목과 발췌문에 실제로 있는 사실만으로 1줄 요약과 분류를 작성하라.
+없는 내용은 절대 지어내지 마라.
+
+출력 형식(이 두 줄 외에는 아무것도 쓰지 말 것):
+분류: <매입매각|개발계획|이전동향|시장동향|정책|업계동향 중 하나>
+요약: <1줄. 30~65자. 반드시 명사로 종결. '했다/한다/이다/전해진다' 금지>
+
+분류 기준: 매입매각=매각·매입·인수·주관사·우선협상 / 개발계획=신축·착공·준공·인허가·
+부지 / 이전동향=사옥·본사 이전·임차·입주 / 시장동향=공실률·임대료·수익률·거래량·전망 /
+정책=정부·국토부·규제·세제·법개정 / 업계동향=실적·인사·펀드·리츠 설정·그 외
+
+제목: {title}
+발췌문: {text}
+--- 출력 ---"""
+
 CATEGORY_LINE_RE = re.compile(r"^\s*(?:분류|카테고리|category)\s*[:：]\s*(.+)$", re.I)
 SUMMARY_PREFIX_RE = re.compile(r"^\s*(?:요약|summary)\s*[:：]\s*", re.I)
 
@@ -791,7 +807,7 @@ PROMPT_LEAK_RE = re.compile(
     r"헤드라인만|요약문만|출력 금지|추측 금지|줄바꿈으로만|거래상대방, 단가|"
     r"예시\(|좋은 예|경제지 기자|최대 2줄|어미|규칙 \d|사용자|요약해야|"
     r"해야 한다|끝낼 것|^조건|^-{2,}|기사 ---|출력 형식|분류 선택지|판단 기준|"
-    r"작성 조건|아래 6개|선택지와)")
+    r"작성 조건|아래 6개|선택지와|발췌문|지어내지|분류 기준)")
 
 # 프롬프트가 35~65자를 요구하므로, 이보다 크게 짧은 줄은 문장 조각으로 간주
 MIN_SUMMARY_LEN = 18
@@ -1042,7 +1058,9 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
     return "", last_err or f"{model_name}: 알 수 없는 오류", False
 
 
-def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "ModelPicker"):
+def generate_summary_with_gemini(article_text: str, gemini_key: str,
+                                 picker: "ModelPicker", title: str = "",
+                                 short: bool = False):
     """
     명사형 1~2줄 요약 + 메일 카테고리 분류. 사용 불가 모델(404 등)은 자동 폴백.
     동사형 어미가 섞이면 1회 재요청. 반환: (카테고리, 요약, 에러)
@@ -1054,7 +1072,11 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
     if picker is None or not picker.current():
         return "", "", "사용 가능한 Gemini 모델 없음"
 
-    prompt = GEMINI_PROMPT.format(text=article_text[:2500])
+    if short:   # 본문 대신 네이버 검색 발췌문만 있는 경우
+        prompt = GEMINI_SHORT_PROMPT.format(title=str(title)[:120],
+                                            text=article_text[:1200])
+    else:
+        prompt = GEMINI_PROMPT.format(text=article_text[:2500])
     errors = []
 
     # 후보 전체를 순회 (일일 한도는 모델별이라 다른 모델은 살아 있을 수 있다)
@@ -1087,19 +1109,33 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
     return "", "", "모든 모델 사용 불가 · " + " / ".join(errors[:2])
 
 
-def summarize_one(row_idx, url, gemini_key, picker, use_ai):
+def summarize_one(row_idx, url, title, desc, gemini_key, picker, use_ai):
     """
     워커: 본문 추출 + 언론사·원문제목 판별 + 요약·분류 생성.
+    본문이 막힌 매체(더벨 등)는 네이버 검색 발췌문을 Gemini에 넘겨 요약한다.
     반환: (idx, 카테고리, 요약, 언론사, 원문제목, 로그)
     """
     text, extractor, final_url, press, page_title = fetch_article(url)
+
+    # ── 본문 확보 실패 → 네이버 검색 발췌문으로 대체 ──
     if not text:
-        return row_idx, "", "", press, page_title, f"본문 추출 실패 → {final_url[:70]}"
+        excerpt = TRUNC_RE.sub("", re.sub(r"\s+", " ", str(desc or "")).strip()).strip()
+        if use_ai and len(excerpt) >= 30:
+            category, summary, err = generate_summary_with_gemini(
+                excerpt, gemini_key, picker, title=title, short=True)
+            if summary:
+                return (row_idx, category, summary, press, page_title,
+                        f"본문 차단({final_url[:45]}) → 네이버 발췌문으로 AI 요약")
+            return (row_idx, category, naver_fallback_summary(excerpt), press,
+                    page_title, f"본문 차단 + AI 실패 → 발췌문 원문 사용 ({err})")
+        return (row_idx, "", naver_fallback_summary(excerpt), press, page_title,
+                f"본문 추출 실패 → {final_url[:70]}")
 
     if not use_ai:
         return row_idx, "", first_sentence(text), press, page_title, None
 
-    category, summary, err = generate_summary_with_gemini(text, gemini_key, picker)
+    category, summary, err = generate_summary_with_gemini(
+        text, gemini_key, picker, title=title)
     if summary:
         return row_idx, category, summary, press, page_title, None
     return row_idx, category, first_sentence(text), press, page_title, \
@@ -1431,12 +1467,13 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         sel_copy = sel.copy()   # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
-        logs, ok, press_filled, title_fixed, cat_ai, naver_fb = [], 0, 0, 0, 0, 0
+        logs, ok, press_filled, title_fixed, cat_ai, naver_fb, desc_ai = [], 0, 0, 0, 0, 0, 0
         total_n = len(sel_copy)
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [
                 ex.submit(summarize_one, i, str(r.get("링크", "")),
+                          str(r.get("제목", "")), str(r.get("요약초안", "")),
                           gemini_key, picker, use_ai)
                 for i, r in sel_copy.iterrows() if str(r.get("링크", ""))
             ]
@@ -1471,6 +1508,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                             if log:
                                 log += " → 네이버 요약문으로 대체"
                     if log:
+                        if "발췌문으로 AI 요약" in log:
+                            desc_ai += 1
                         logs.append(log)
                 except Exception as e:
                     logs.append(f"워커 오류: {str(e)[:100]}")
@@ -1494,7 +1533,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                  + (f" · 분류 {cat_ai}건 AI 재조정" if cat_ai else "")
                  + (f" · 언론사 {press_filled}건 보완" if press_filled else "")
                  + (f" · 잘린 제목 {title_fixed}건 복원" if title_fixed else "")
-                 + (f" · 크롤링 차단 {naver_fb}건은 네이버 요약문 사용" if naver_fb else ""))
+                 + (f" · 본문 차단 {desc_ai}건은 발췌문으로 AI 요약" if desc_ai else "")
+                 + (f" · {naver_fb}건은 발췌문 원문 사용" if naver_fb else ""))
 
         still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
