@@ -894,6 +894,22 @@ def resolve_gemini_candidates(gemini_key: str):
 DEAD_MODEL_CODES = (400, 403, 404)
 MAX_OUTPUT_TOKENS = 800
 
+# 429 응답에서 원인·대기시간을 뽑아내기 위한 패턴
+RETRY_DELAY_RE = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
+QUOTA_ID_RE = re.compile(r'"quotaId"\s*:\s*"([^"]+)"')
+QUOTA_METRIC_RE = re.compile(r'"quotaMetric"\s*:\s*"([^"]+)"')
+
+
+def _quota_reason(body: str):
+    """429 본문에서 (사람이 읽을 원인, 일일한도여부) 추출."""
+    q = QUOTA_ID_RE.search(body) or QUOTA_METRIC_RE.search(body)
+    qid = q.group(1) if q else ""
+    per_day = bool(re.search(r"PerDay|per_day", qid, re.I))
+    if qid:
+        kind = "일일 한도(RPD)" if per_day else "분당 한도(RPM/TPM)"
+        return f"{kind} · {qid.split('/')[-1]}", per_day
+    return "원인 미상", False
+
 
 def _call_gemini(prompt: str, gemini_key: str, model_name: str):
     """
@@ -915,7 +931,7 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
     thinking_off = True
     last_err = ""
 
-    for _ in range(3):
+    for attempt in range(4):
         try:
             r = requests.post(url, headers=headers, json=build(thinking_off), timeout=30)
         except Exception as e:
@@ -944,8 +960,21 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
                 return out, None, False
             return "", f"{model_name}: 빈 응답 (finishReason={finish or '?'})", False
 
-        if r.status_code in (429, 500, 503):
-            last_err = f"{model_name} HTTP {r.status_code} (재시도)"
+        if r.status_code == 429:
+            body = re.sub(r"\s+", " ", r.text)
+            reason, per_day = _quota_reason(body)
+            if per_day:      # 일일 한도는 기다려도 안 풀린다
+                return "", (f"{model_name}: 429 {reason} — 오늘 무료 사용량 소진. "
+                            f"내일 초기화되거나 결제 연결 필요"), False
+            m = RETRY_DELAY_RE.search(body)
+            delay = min(float(m.group(1)) if m else 8 * (attempt + 1), 60)
+            last_err = (f"{model_name}: 429 {reason} · "
+                        f"{delay:.0f}초 대기 후 재시도 {attempt + 1}/4")
+            time.sleep(delay)
+            continue
+
+        if r.status_code in (500, 503):
+            last_err = f"{model_name} HTTP {r.status_code} (일시 오류, 재시도)"
             time.sleep(2.0)
             continue
 
