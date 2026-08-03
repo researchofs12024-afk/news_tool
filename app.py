@@ -1007,7 +1007,8 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
     prompt = GEMINI_PROMPT.format(text=article_text[:2500])
     errors = []
 
-    for _ in range(4):
+    # 후보 전체를 순회 (일일 한도는 모델별이라 다른 모델은 살아 있을 수 있다)
+    for _ in range(max(len(picker.candidates), 1)):
         model_name = picker.current()
         if not model_name:
             break
@@ -1031,6 +1032,8 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
             return summary, None
         return "", f"{model_name}: 후처리 후 빈 결과"
 
+    if errors and all("일일 한도" in e for e in errors):
+        return "", f"무료 일일 한도 소진 (모델 {len(errors)}개 전부)"
     return "", "모든 모델 사용 불가 · " + " / ".join(errors[:2])
 
 
@@ -1370,10 +1373,14 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 st.error(f"Gemini 모델 확인 실패 → 첫 문장 요약으로 대체합니다. ({cerr2})")
                 use_ai = False
             else:
-                picker = ModelPicker(cand_list)
-                st.info(f"Gemini 1순위 모델: `{cand_list[0]}`"
-                        + (f" (실패 시 {len(cand_list) - 1}개 후보로 자동 폴백)"
-                           if len(cand_list) > 1 else ""))
+                # 오늘 이미 한도가 소진된 모델은 다시 시도하지 않는다 (쿼터 절약)
+                spent = st.session_state.get("_gemini_spent", {})
+                alive = [m for m in cand_list if m not in spent] or cand_list
+                picker = ModelPicker(alive)
+                st.info(f"Gemini 1순위 모델: `{alive[0]}`"
+                        + (f" (실패 시 {len(alive) - 1}개 후보로 자동 폴백)"
+                           if len(alive) > 1 else "")
+                        + (f" · 한도 소진으로 제외한 모델 {len(spent)}개" if spent else ""))
 
         sel_copy = sel.copy()   # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
@@ -1409,6 +1416,18 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                     logs.append(f"워커 오류: {str(e)[:100]}")
                 prog.progress(n / max(total_n, 1), text=f"처리 중... ({n}/{total_n})")
         prog.empty()
+
+        # 한도 소진 모델을 세션에 기억해 다음 실행에서 건너뛴다
+        if picker is not None and picker.dead:
+            spent = dict(st.session_state.get("_gemini_spent", {}))
+            spent.update({m: w for m, w in picker.dead.items() if "일일 한도" in w})
+            st.session_state["_gemini_spent"] = spent
+            if not picker.current():
+                st.error(
+                    "🚫 무료 Gemini 일일 사용량을 모두 소진했습니다. 요약은 기사 첫 문장으로 "
+                    "대체됐습니다.\n\n"
+                    "· 한도 초기화: 태평양 시간 자정 = **한국시간 다음날 오후 4시**\n"
+                    "· 지금 바로 쓰려면 Google AI Studio에서 결제 연결(유료 티어) 필요")
 
         label = "Gemini 요약" if use_ai else "첫 문장 요약"
         st.write(f"**결과:** ✓ {ok}/{total_n}건 {label} 성공"
