@@ -41,6 +41,7 @@ st.set_page_config(page_title="상업용 부동산 뉴스 클리핑", page_icon=
 
 KST = dt.timezone(dt.timedelta(hours=9))
 PRESS_PLACEHOLDER = "(언론사 기입 필요)"
+MAIL_CATEGORIES = ["개발계획", "매입매각", "이전동향", "업계동향", "시장동향", "정책"]
 
 UA_HEADERS = {
     "User-Agent": (
@@ -749,22 +750,39 @@ def first_sentence(text: str, max_chars: int = 150) -> str:
 # ══════════════════════════════════════════════════════════════
 # Gemini (REST 직접 호출)
 # ══════════════════════════════════════════════════════════════
-GEMINI_PROMPT = """아래 기사를 부동산 업계용 '기사 상단 요약'으로 바꿔라.
+GEMINI_PROMPT = """아래 기사를 부동산 업계용 '기사 상단 요약'으로 바꾸고 분류하라.
 
-조건: 1~2줄. 각 줄 35~65자. 모든 줄을 명사로 끝낼 것(매각·매입·추진·확정·완료·
-착수·예정·검토·전망·체결 등). '했다/한다/이다/밝혔다' 같은 서술형 어미 금지.
-첫 줄은 주체+대상+규모+행위. 둘째 줄은 기사에 있는 내용만.
-설명·번호·불릿·따옴표 없이 요약문만 출력.
+출력 형식(이 두 줄 외에는 아무것도 쓰지 말 것):
+분류: <아래 6개 중 하나>
+요약: <1줄. 한 줄에 안 담기면 줄바꿈 후 2줄까지>
+
+분류 선택지와 판단 기준:
+- 매입매각: 자산·지분·건물의 매각·매입·인수, 매각주관사 선정, 우선협상자, 딜 클로징
+- 개발계획: 신축·복합개발·착공·준공·인허가·부지확보·설계·기공
+- 이전동향: 사옥·본사 이전, 신규 임차, 입주, 리모델링, 사무실 이동
+- 시장동향: 공실률·임대료·수익률·거래량·가격지수 등 시장 통계와 전망
+- 정책: 정부·국토부·금융당국의 규제, 세제, 법·제도 개정
+- 업계동향: 운용사·증권·보험·건설사의 실적·인사·조직, 펀드·리츠 설정, 그 외
+
+요약 작성 조건:
+각 줄 35~65자. 모든 줄을 명사로 끝낼 것(매각·매입·추진·확정·완료·착수·예정·
+검토·전망·체결 등). '했다/한다/이다/밝혔다' 같은 서술형 어미 금지.
+첫 줄은 주체+대상+규모+행위. 둘째 줄은 기사에 실제로 있는 내용만.
+번호·불릿·따옴표 없이.
 
 좋은 예:
-현대건설, 여의도 사옥 4500억 규모 매각 완료
+분류: 매입매각
+요약: 현대건설, 여의도 사옥 4500억 규모 매각 완료
 매수자는 이지스자산운용, 평당 3200만원으로 3분기 서울 오피스 최대 거래
 
 --- 기사 ---
 {text}
---- 요약 ---"""
+--- 출력 ---"""
 
 STRICT_SUFFIX = "\n\n(직전 답변에 서술형 어미가 있었다. 모든 줄을 명사로 끝내라.)"
+
+CATEGORY_LINE_RE = re.compile(r"^\s*(?:분류|카테고리|category)\s*[:：]\s*(.+)$", re.I)
+SUMMARY_PREFIX_RE = re.compile(r"^\s*(?:요약|summary)\s*[:：]\s*", re.I)
 
 VERB_END_RE = re.compile(
     r"(했다|한다|이다|된다|였다|겠다|봤다|섰다|왔다|났다|한다고|합니다|입니다|습니다|"
@@ -777,7 +795,8 @@ PROMPT_LEAK_RE = re.compile(
     r"(줄차|명사형|명사로|동사형|서술형|기사에 실제로|실제로 있는 것만|작성 규칙|"
     r"헤드라인만|요약문만|출력 금지|추측 금지|줄바꿈으로만|거래상대방, 단가|"
     r"예시\(|좋은 예|경제지 기자|최대 2줄|어미|규칙 \d|사용자|요약해야|"
-    r"해야 한다|끝낼 것|^조건|^-{2,}|기사 ---)")
+    r"해야 한다|끝낼 것|^조건|^-{2,}|기사 ---|출력 형식|분류 선택지|판단 기준|"
+    r"작성 조건|아래 6개|선택지와)")
 
 # 프롬프트가 35~65자를 요구하므로, 이보다 크게 짧은 줄은 문장 조각으로 간주
 MIN_SUMMARY_LEN = 18
@@ -799,18 +818,36 @@ def _valid_summary_line(ln: str) -> bool:
 
 
 def _postprocess_summary(raw: str):
-    """불릿·번호 제거, 유출·조각 제거, 최대 2줄로 정리. 반환: (요약, 동사형발견여부)"""
-    lines = []
+    """
+    '분류:' 줄과 요약 줄을 분리하고, 불릿·프롬프트 유출·문장 조각을 제거.
+    반환: (카테고리, 요약, 동사형발견여부)
+    """
+    category, lines = "", []
     for ln in (raw or "").split("\n"):
-        ln = BULLET_RE.sub("", ln.strip()).strip(" \"'`“”‘’")
+        ln = ln.strip().strip("*#").strip()   # 마크다운 강조 제거
+        if not ln:
+            continue
+
+        m = CATEGORY_LINE_RE.match(ln)
+        if m and not category:
+            cand = re.sub(r"[^가-힣]", "", m.group(1))
+            for c in MAIL_CATEGORIES:
+                if c in cand:
+                    category = c
+                    break
+            continue
+
+        ln = SUMMARY_PREFIX_RE.sub("", ln)
+        ln = BULLET_RE.sub("", ln).strip(" \"'`“”‘’")
         ln = re.sub(r"\s+", " ", ln)
         if _valid_summary_line(ln):
             lines.append(ln[:90])
         if len(lines) == 2:
             break
+
     if not lines:
-        return "", False
-    return "\n".join(lines), any(VERB_END_RE.search(l) for l in lines)
+        return category, "", False
+    return category, "\n".join(lines), any(VERB_END_RE.search(l) for l in lines)
 
 BAD_MODEL_TOKENS = ("embedding", "aqa", "vision", "imagen", "tts", "live",
                     "gemma", "image", "veo", "learnlm", "thinking")
@@ -989,16 +1026,16 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
 
 def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "ModelPicker"):
     """
-    명사형 1~2줄 요약 생성.
+    명사형 1~2줄 요약 + 메일 카테고리 분류.
     사용 불가 모델(404 등)은 자동으로 건너뛰고 다음 후보로 폴백.
-    동사형 어미가 섞이면 1회 재요청. 반환: (요약, 에러)
+    동사형 어미가 섞이면 1회 재요청. 반환: (카테고리, 요약, 에러)
     """
     if not gemini_key:
-        return "", "GEMINI_API_KEY 없음"
+        return "", "", "GEMINI_API_KEY 없음"
     if not article_text:
-        return "", "본문 없음"
+        return "", "", "본문 없음"
     if picker is None or not picker.current():
-        return "", "사용 가능한 Gemini 모델 없음"
+        return "", "", "사용 가능한 Gemini 모델 없음"
 
     prompt = GEMINI_PROMPT.format(text=article_text[:2500])
     errors = []
@@ -1014,38 +1051,38 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
             errors.append(err)
             continue
         if not raw:
-            return "", err
+            return "", "", err
 
-        summary, has_verb = _postprocess_summary(raw)
+        category, summary, has_verb = _postprocess_summary(raw)
         if has_verb:  # 명사형 위반 → 강한 지시로 1회 재시도
             raw2, _e2, _d2 = _call_gemini(prompt + STRICT_SUFFIX, gemini_key, model_name)
             if raw2:
-                summary2, has_verb2 = _postprocess_summary(raw2)
+                cat2, summary2, has_verb2 = _postprocess_summary(raw2)
                 if summary2 and not has_verb2:
-                    return summary2, None
+                    return (cat2 or category), summary2, None
         if summary:
-            return summary, None
-        return "", f"{model_name}: 후처리 후 빈 결과"
+            return category, summary, None
+        return category, "", f"{model_name}: 후처리 후 빈 결과"
 
-    return "", "모든 모델 사용 불가 · " + " / ".join(errors[:2])
+    return "", "", "모든 모델 사용 불가 · " + " / ".join(errors[:2])
 
 
 def summarize_one(row_idx, url, gemini_key, picker, use_ai):
     """
-    워커: 본문 추출 + 언론사·원문제목 판별 + 요약 생성.
-    반환: (idx, 요약, 언론사, 원문제목, 로그)
+    워커: 본문 추출 + 언론사·원문제목 판별 + 요약·분류 생성.
+    반환: (idx, 카테고리, 요약, 언론사, 원문제목, 로그)
     """
     text, extractor, final_url, press, page_title = fetch_article(url)
     if not text:
-        return row_idx, "", press, page_title, f"본문 추출 실패 → {final_url[:70]}"
+        return row_idx, "", "", press, page_title, f"본문 추출 실패 → {final_url[:70]}"
 
     if not use_ai:
-        return row_idx, first_sentence(text), press, page_title, None
+        return row_idx, "", first_sentence(text), press, page_title, None
 
-    summary, err = generate_summary_with_gemini(text, gemini_key, picker)
+    category, summary, err = generate_summary_with_gemini(text, gemini_key, picker)
     if summary:
-        return row_idx, summary, press, page_title, None
-    return row_idx, first_sentence(text), press, page_title, \
+        return row_idx, category, summary, press, page_title, None
+    return row_idx, category, first_sentence(text), press, page_title, \
         f"[Gemini실패/{extractor}] {err}"
 
 
@@ -1208,7 +1245,8 @@ if st.button("🔍 뉴스 수집 시작", type="primary", **FULL_W):
         df = pd.DataFrame()
 
     # 재수집 시 하위 상태 초기화
-    for k in ("editor_df", "mail_html", "collected"):
+    for k in ("editor_df", "mail_html", "collected", "result_df",
+              "picked_rows", "picker_table", "refine"):
         st.session_state.pop(k, None)
 
     if df.empty:
@@ -1236,8 +1274,6 @@ if st.button("🔍 뉴스 수집 시작", type="primary", **FULL_W):
 # ══════════════════════════════════════════════════════════════
 # 배포 편집
 # ══════════════════════════════════════════════════════════════
-MAIL_CATEGORIES = ["개발계획", "매입매각", "이전동향", "업계동향", "시장동향", "정책"]
-
 CATEGORY_RULES = [
     ("매입매각", ["매각", "매입", "매매", "인수", "거래", "딜 ", "클로징", "매각주관", "우선협상"]),
     ("개발계획", ["개발", "복합개발", "신축", "착공", "준공", "인허가", "부지", "설계", "기공"]),
@@ -1257,6 +1293,14 @@ def suggest_category(keyword: str, title: str) -> str:
         if score > best_score:
             best, best_score = cat, score
     return best
+
+
+def sort_for_mail(df):
+    """메일 카테고리 순 → 최신순 정렬."""
+    out = df.copy()
+    out["_c"] = out["메일카테고리"].map({c: i for i, c in enumerate(MAIL_CATEGORIES)})
+    out = out.sort_values(["_c", "발행시각"], ascending=[True, False])
+    return out.drop(columns="_c", errors="ignore")
 
 
 def build_mail_html(sel_df):
@@ -1304,57 +1348,68 @@ def build_mail_html(sel_df):
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
-    st.caption("배포할 기사를 선택하고 카테고리를 지정한 뒤 요약을 다듬으세요.")
+    st.caption("배포할 기사의 **행 아무 곳이나 클릭**하면 선택됩니다 "
+               "(여러 건 연속 클릭 가능, 다시 클릭하면 해제). "
+               "분류와 요약은 [메일 본문 생성] 시 AI가 기사 내용을 읽고 채웁니다.")
 
     base = st.session_state["collected"].copy()
     token = st.session_state.get("collect_token", "")
 
     if st.session_state.get("editor_token") != token:
         edit = base.copy()
-        edit.insert(0, "선택", False)
         edit["메일카테고리"] = edit.apply(
             lambda r: suggest_category(str(r.get("키워드", "")), str(r.get("제목", ""))), axis=1)
         edit["언론사"] = edit["언론사"].fillna("").apply(
             lambda s: s if str(s).strip() else PRESS_PLACEHOLDER)
-        edit["요약"] = edit["요약초안"].fillna("").apply(lambda t: first_sentence(t, 70))
+        edit["요약"] = ""
         st.session_state["editor_df"] = edit
         st.session_state["editor_token"] = token
+        st.session_state.pop("picked_rows", None)
 
     if st.session_state.pop("_flash", None):
         st.success(st.session_state.pop("_flash_msg", "완료"))
 
-    edited_df = st.data_editor(
-        st.session_state["editor_df"],
+    work_df = st.session_state["editor_df"]
+
+    ac1, ac2, _ = st.columns([1, 1, 3])
+    if ac1.button("전체 선택", **FULL_W):
+        st.session_state["picked_rows"] = list(range(len(work_df)))
+        st.session_state.pop("picker_table", None)
+        st.rerun()
+    if ac2.button("전체 해제", **FULL_W):
+        st.session_state["picked_rows"] = []
+        st.session_state.pop("picker_table", None)
+        st.rerun()
+
+    event = st.dataframe(
+        work_df,
         hide_index=True, **FULL_W, height=460,
-        column_order=["선택", "키워드", "메일카테고리", "제목", "요약",
-                      "언론사", "발행시각", "링크"],
+        key="picker_table",
+        on_select="rerun",
+        selection_mode="multi-row",
+        selection_default={"selection": {
+            "rows": st.session_state.get("picked_rows", []),
+            "columns": [], "cells": []}},
+        column_order=["키워드", "제목", "언론사", "발행시각", "링크"],
         column_config={
-            "선택": st.column_config.CheckboxColumn("선택", width="small"),
-            "키워드": st.column_config.TextColumn("키워드", width=col_width(110, "small")),
-            "메일카테고리": st.column_config.SelectboxColumn(
-                "메일 카테고리", options=MAIL_CATEGORIES, width=col_width(110, "small")),
-            "제목": st.column_config.TextColumn("제목", width=col_width(500)),
-            "요약": st.column_config.TextColumn("요약 (직접 수정)", width=col_width(400)),
-            "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width=col_width(120, "small")),
+            "키워드": st.column_config.TextColumn("키워드", width=col_width(120, "small")),
+            "제목": st.column_config.TextColumn("제목", width=col_width(640)),
+            "언론사": st.column_config.TextColumn("언론사", width=col_width(120, "small")),
             "발행시각": st.column_config.TextColumn("발행시각", width=col_width(125, "small")),
             "링크": st.column_config.LinkColumn("링크", display_text="열기",
                                               width=col_width(70, "small")),
             "요약초안": None, "카테고리": None, "네이버링크": None,
+            "메일카테고리": None, "요약": None,
         },
-        disabled=["제목", "키워드", "발행시각", "링크"],
-        key="editor",
     )
 
-    sel = edited_df[edited_df["선택"] == True].copy()  # 원본 인덱스 유지
+    picked = list(getattr(event, "selection", {}).get("rows", []))
+    st.session_state["picked_rows"] = picked
+    sel = work_df.iloc[picked].copy() if picked else work_df.iloc[0:0].copy()
+
     st.write(f"선택된 기사: **{len(sel)}건**")
 
-    if not sel.empty:
-        need_press = sel[sel["언론사"].astype(str).str.strip().isin(["", PRESS_PLACEHOLDER])]
-        if not need_press.empty:
-            st.caption(f"ℹ️ 선택한 기사 중 {len(need_press)}건은 언론사가 비어 있습니다. "
-                       "메일 본문 생성 시 자동으로 채워집니다.")
-
-    make_mail = st.button("📋 메일 본문 생성", type="primary",
+    make_mail = st.button("📋 메일 본문 생성 (AI 요약 + 자동 분류)", type="primary",
                           **FULL_W, disabled=sel.empty)
 
     if make_mail:
@@ -1376,7 +1431,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         sel_copy = sel.copy()  # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
-        logs, ok, press_filled, title_fixed = [], 0, 0, 0
+        logs, ok, press_filled, title_fixed, cat_ai = [], 0, 0, 0, 0
         total_n = len(sel_copy)
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1387,11 +1442,16 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             ]
             for n, fut in enumerate(as_completed(futures), start=1):
                 try:
-                    idx, summary, press, page_title, log = fut.result()
+                    idx, category, summary, press, page_title, log = fut.result()
                     if summary:
                         sel_copy.loc[idx, "요약"] = summary
                         if log is None:
                             ok += 1
+                    # AI가 판단한 카테고리를 우선 적용 (실패 시 규칙 기반 값 유지)
+                    if category in MAIL_CATEGORIES:
+                        if sel_copy.loc[idx, "메일카테고리"] != category:
+                            cat_ai += 1
+                        sel_copy.loc[idx, "메일카테고리"] = category
                     cur = str(sel_copy.loc[idx, "언론사"]).strip()
                     if press and cur in ("", PRESS_PLACEHOLDER, "nan"):
                         sel_copy.loc[idx, "언론사"] = press
@@ -1411,8 +1471,9 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         label = "Gemini 요약" if use_ai else "첫 문장 요약"
         st.write(f"**결과:** ✓ {ok}/{total_n}건 {label} 성공"
+                 + (f" · 분류 {cat_ai}건 AI 재조정" if cat_ai else "")
                  + (f" · 언론사 {press_filled}건 보완" if press_filled else "")
-                 + (f" · 잘린 제목 {title_fixed}건 원문으로 복원" if title_fixed else ""))
+                 + (f" · 잘린 제목 {title_fixed}건 복원" if title_fixed else ""))
 
         still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
@@ -1425,21 +1486,47 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 for log in logs[:20]:
                     st.text(f"• {log}")
 
-        ordered = sel_copy.copy()
-        ordered["_c"] = ordered["메일카테고리"].map(
-            {c: i for i, c in enumerate(MAIL_CATEGORIES)})
-        ordered = ordered.sort_values(["_c", "발행시각"], ascending=[True, False])
-        st.session_state["mail_html"] = build_mail_html(ordered)
-
-        # 생성 결과(요약·언론사)를 편집표에 반영해두기
-        back = edited_df.copy()
+        # 생성 결과를 원본 표에 반영 + 다듬기 표의 원본으로 저장
+        back = st.session_state["editor_df"].copy()
         for idx in sel_copy.index:
-            back.loc[idx, "요약"] = sel_copy.loc[idx, "요약"]
-            back.loc[idx, "언론사"] = sel_copy.loc[idx, "언론사"]
-            back.loc[idx, "제목"] = sel_copy.loc[idx, "제목"]
+            for col in ("요약", "언론사", "제목", "메일카테고리"):
+                back.loc[idx, col] = sel_copy.loc[idx, col]
         st.session_state["editor_df"] = back
+        st.session_state["result_df"] = sel_copy
+        st.session_state["mail_html"] = build_mail_html(sort_for_mail(sel_copy))
+        st.session_state.pop("refine", None)
+        st.success("✅ 메일 본문이 생성되었습니다.")
 
-        st.success("✅ 메일 본문이 생성되었습니다. (편집표에도 반영됨)")
+    # ── 생성 결과 다듬기 ─────────────────────────────────────
+    if "result_df" in st.session_state and not st.session_state["result_df"].empty:
+        st.subheader("생성 결과 다듬기")
+        st.caption("분류·요약·언론사를 직접 고친 뒤 [메일 본문 다시 만들기]를 누르세요.")
+
+        refined = st.data_editor(
+            st.session_state["result_df"],
+            hide_index=True, **FULL_W, height=340,
+            column_order=["메일카테고리", "제목", "요약", "언론사", "링크"],
+            column_config={
+                "메일카테고리": st.column_config.SelectboxColumn(
+                    "분류", options=MAIL_CATEGORIES, width=col_width(110, "small")),
+                "제목": st.column_config.TextColumn("제목", width=col_width(430)),
+                "요약": st.column_config.TextColumn("요약", width=col_width(430)),
+                "언론사": st.column_config.TextColumn("언론사", width=col_width(120, "small")),
+                "링크": st.column_config.LinkColumn("링크", display_text="열기",
+                                                  width=col_width(70, "small")),
+                "요약초안": None, "카테고리": None, "네이버링크": None,
+                "키워드": None, "발행시각": None,
+            },
+            disabled=["링크"],
+            key="refine",
+        )
+
+        if st.button("🔁 메일 본문 다시 만들기", **FULL_W):
+            st.session_state["result_df"] = refined
+            st.session_state["mail_html"] = build_mail_html(sort_for_mail(refined))
+            st.session_state["_flash"] = True
+            st.session_state["_flash_msg"] = "✅ 메일 본문을 다시 만들었습니다."
+            st.rerun()
 
     if "mail_html" in st.session_state:
         st.subheader("메일 본문")
