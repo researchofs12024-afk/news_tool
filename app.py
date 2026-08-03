@@ -89,8 +89,6 @@ try:
 except Exception:
     ROW_HEIGHT_OK = False
 
-# 표 셀 줄바꿈(allowWrapping)은 row_height가 4rem을 넘을 때만 켜지며 1.45+ 에서만 구현됨
-WRAP_OK = ROW_HEIGHT_OK and _st_version() >= (1, 45)
 
 
 def _full_width_kwargs():
@@ -632,35 +630,22 @@ def first_sentence(text: str, max_chars: int = 150) -> str:
 # ══════════════════════════════════════════════════════════════
 # Gemini (REST 직접 호출)
 # ══════════════════════════════════════════════════════════════
-GEMINI_PROMPT = """당신은 경제지 기자입니다. 아래 기사를 상업용 부동산 업계 관계자에게 전달할
-'기사 상단 요약'으로 작성하세요.
+GEMINI_PROMPT = """아래 기사를 부동산 업계용 '기사 상단 요약'으로 바꿔라.
 
-작성 규칙:
-1. 반드시 명사형으로 종결 — 매각, 매입, 추진, 확정, 완료, 착수, 예정, 검토, 전망,
-   무산, 유치, 선정, 돌입, 확대, 축소, 체결 등
-2. "~한다" "~했다" "~이다" "~된다" "~밝혔다" "~나섰다" 등 동사·서술형 어미 절대 금지
-3. 핵심이 한 문장에 담기면 1줄만, 담기지 않으면 2줄까지 (최대 2줄, 3줄 이상 금지)
-4. 각 줄 35~65자
-5. 1줄차: 주체(기업·기관명) + 대상 자산 + 규모(금액·면적) + 행위
-   2줄차: 거래상대방, 단가, 배경, 일정, 시장 의미 중 기사에 실제로 있는 것만
-6. 기사에 없는 내용 추가 금지, 추측 금지
-7. 번호·불릿기호·따옴표 없이 줄바꿈으로만 구분
-8. 요약문 외 어떤 말도 출력 금지
+조건: 1~2줄. 각 줄 35~65자. 모든 줄을 명사로 끝낼 것(매각·매입·추진·확정·완료·
+착수·예정·검토·전망·체결 등). '했다/한다/이다/밝혔다' 같은 서술형 어미 금지.
+첫 줄은 주체+대상+규모+행위. 둘째 줄은 기사에 있는 내용만.
+설명·번호·불릿·따옴표 없이 요약문만 출력.
 
-예시(1줄):
-이지스자산운용, 여의도 오피스 4500억 규모 매입 완료
-
-예시(2줄):
+좋은 예:
 현대건설, 여의도 사옥 4500억 규모 매각 완료
 매수자는 이지스자산운용, 평당 3200만원으로 3분기 서울 오피스 최대 거래
 
-기사:
+--- 기사 ---
 {text}
+--- 요약 ---"""
 
-요약:"""
-
-STRICT_SUFFIX = ("\n\n(경고: 직전 답변에 동사형 어미가 있었습니다. "
-                 "모든 줄을 반드시 명사로 끝내세요.)")
+STRICT_SUFFIX = "\n\n(직전 답변에 서술형 어미가 있었다. 모든 줄을 명사로 끝내라.)"
 
 VERB_END_RE = re.compile(
     r"(했다|한다|이다|된다|였다|겠다|봤다|섰다|왔다|났다|한다고|합니다|입니다|습니다|"
@@ -668,14 +653,39 @@ VERB_END_RE = re.compile(
 
 BULLET_RE = re.compile(r"^\s*(?:[-•*▷▶·ㆍ○●]|\d+[.)])\s*")
 
+# 프롬프트 규칙문이나 모델의 사고 과정이 새어 나온 줄을 걸러내기 위한 패턴
+PROMPT_LEAK_RE = re.compile(
+    r"(줄차|명사형|명사로|동사형|서술형|기사에 실제로|실제로 있는 것만|작성 규칙|"
+    r"헤드라인만|요약문만|출력 금지|추측 금지|줄바꿈으로만|거래상대방, 단가|"
+    r"예시\(|좋은 예|경제지 기자|최대 2줄|어미|규칙 \d|사용자|요약해야|"
+    r"해야 한다|끝낼 것|^조건|^-{2,}|기사 ---)")
+
+# 프롬프트가 35~65자를 요구하므로, 이보다 크게 짧은 줄은 문장 조각으로 간주
+MIN_SUMMARY_LEN = 18
+
+
+def _valid_summary_line(ln: str) -> bool:
+    """문장 조각·프롬프트 유출 줄 배제."""
+    if len(ln) < MIN_SUMMARY_LEN:
+        return False
+    if PROMPT_LEAK_RE.search(ln):
+        return False
+    if ln[0] in ",·:;)]}…”’-+/=":      # 조각으로 시작
+        return False
+    if ln.rstrip().endswith((",", "·", "및", "와", "과", "의")):  # 조각으로 끝
+        return False
+    if not re.search(r"[가-힣]", ln):   # 한글이 없으면 요약이 아님
+        return False
+    return True
+
 
 def _postprocess_summary(raw: str):
-    """불릿·번호 제거, 최대 2줄로 정리. 반환: (요약, 동사형발견여부)"""
+    """불릿·번호 제거, 유출·조각 제거, 최대 2줄로 정리. 반환: (요약, 동사형발견여부)"""
     lines = []
     for ln in (raw or "").split("\n"):
         ln = BULLET_RE.sub("", ln.strip()).strip(" \"'`“”‘’")
         ln = re.sub(r"\s+", " ", ln)
-        if len(ln) >= 8:
+        if _valid_summary_line(ln):
             lines.append(ln[:90])
         if len(lines) == 2:
             break
@@ -786,19 +796,33 @@ def resolve_gemini_candidates(gemini_key: str):
 DEAD_MODEL_CODES = (400, 403, 404)
 
 
+MAX_OUTPUT_TOKENS = 800
+
+
 def _call_gemini(prompt: str, gemini_key: str, model_name: str):
-    """단일 호출 + 재시도. 반환: (원문텍스트, 에러, 모델폐기여부)"""
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.3},
-    }
+    """
+    단일 호출 + 재시도. 반환: (원문텍스트, 에러, 모델폐기여부)
+
+    핵심: 2.5 이상 모델은 기본이 '사고(thinking) 모드'라 출력 토큰을 내부 추론에
+    소진한다. 그 결과 답변 대신 잘린 추론 조각이 돌아와 프롬프트 규칙문이
+    요약으로 들어가는 사고가 발생했다. → thinkingBudget=0 으로 끄고,
+    thought 파트는 결과에서 제외하며, MAX_TOKENS 종료는 실패로 처리한다.
+    """
     headers = {"Content-Type": "application/json", "x-goog-api-key": gemini_key}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
+    def build(thinking_off: bool):
+        gc = {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 0.3}
+        if thinking_off:
+            gc["thinkingConfig"] = {"thinkingBudget": 0}
+        return {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gc}
+
+    thinking_off = True
     last_err = ""
-    for _ in range(2):
+
+    for _ in range(3):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=25)
+            r = requests.post(url, headers=headers, json=build(thinking_off), timeout=30)
         except Exception as e:
             last_err = f"{model_name}: 요청 오류 {str(e)[:100]}"
             time.sleep(1.5)
@@ -810,23 +834,38 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
             if not candidates:
                 fb = data.get("promptFeedback", {})
                 return "", f"{model_name}: 후보 없음 (blockReason={fb.get('blockReason', '?')})", False
+
             cand = candidates[0]
+            finish = cand.get("finishReason", "")
             parts = cand.get("content", {}).get("parts", [])
-            out = "".join(p.get("text", "") for p in parts).strip()
+            # thought=True 파트(사고 과정)는 답변이 아니므로 제외
+            out = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+
+            if finish == "MAX_TOKENS":
+                if thinking_off:
+                    return "", f"{model_name}: 출력 토큰 초과 (응답 잘림)", False
+                thinking_off = True   # 사고 모드 때문이라면 끄고 재시도
+                continue
             if out:
                 return out, None, False
-            return "", f"{model_name}: 빈 응답 (finishReason={cand.get('finishReason', '?')})", False
+            return "", f"{model_name}: 빈 응답 (finishReason={finish or '?'})", False
 
         if r.status_code in (429, 500, 503):
             last_err = f"{model_name} HTTP {r.status_code} (재시도)"
             time.sleep(2.0)
             continue
 
-        # 400/403/404 → 이 모델은 이 키로 사용 불가. 다음 후보로 넘긴다.
-        msg = re.sub(r"\s+", " ", r.text)[:160]
+        msg = re.sub(r"\s+", " ", r.text)[:180]
+
+        # thinkingConfig를 지원하지 않는 모델 → 옵션 빼고 재시도 (폐기하지 않음)
+        if r.status_code == 400 and thinking_off and re.search(r"thinking", msg, re.I):
+            thinking_off = False
+            continue
+
+        # 400/403/404 → 이 키로 사용 불가한 모델. 다음 후보로 넘긴다.
         return "", f"{model_name} HTTP {r.status_code}: {msg}", r.status_code in DEAD_MODEL_CODES
 
-    return "", last_err or "알 수 없는 오류", False
+    return "", last_err or f"{model_name}: 알 수 없는 오류", False
 
 
 def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "ModelPicker"):
@@ -1144,84 +1183,6 @@ def build_mail_html(sel_df):
     return "".join(parts)
 
 
-CARD_PER_PAGE = 20
-
-
-def clear_card_keys():
-    """편집표를 프로그램이 갱신했을 때 카드 위젯의 낡은 값 제거."""
-    for k in [k for k in list(st.session_state.keys()) if k.startswith("c_")]:
-        st.session_state.pop(k, None)
-
-
-def render_card_editor(df):
-    """
-    제목이 절대 잘리지 않는 카드형 편집 UI (Streamlit 버전 무관).
-    반환: 현재 편집표 DataFrame
-    """
-    f1, f2 = st.columns([3, 1])
-    q = f1.text_input("제목 검색", key="card_q", placeholder="예: 물류센터, 이지스…")
-    only_sel = f2.checkbox("선택한 기사만", key="card_only_sel")
-
-    view = df
-    if q and q.strip():
-        view = view[view["제목"].astype(str).str.contains(q.strip(), case=False, na=False)]
-    if only_sel:
-        view = view[view["선택"] == True]
-
-    total = len(view)
-    pages = max((total - 1) // CARD_PER_PAGE + 1, 1)
-    page = 1
-    if pages > 1:
-        page = int(st.number_input(f"페이지 (총 {pages}쪽 · {total}건)",
-                                   min_value=1, max_value=pages, value=1, key="card_page"))
-    page = min(page, pages)
-    sub = view.iloc[(page - 1) * CARD_PER_PAGE: page * CARD_PER_PAGE]
-
-    if sub.empty:
-        st.info("조건에 맞는 기사가 없습니다.")
-        return df
-
-    st.caption("체크 → 카테고리·요약·언론사 수정 → 맨 아래 **[변경사항 적용]** 클릭 "
-               "(적용 전까지는 저장되지 않습니다)")
-
-    with st.form("card_form"):
-        for idx, row in sub.iterrows():
-            c1, c2 = st.columns([0.05, 0.95])
-            c1.checkbox("선택", key=f"c_sel_{idx}", value=bool(row["선택"]),
-                        label_visibility="collapsed")
-            with c2:
-                st.markdown(f"**[{row['제목']}]({row['링크']})**")
-                st.caption(f"{row.get('키워드', '')} · {row.get('발행시각', '')}")
-                e1, e2, e3 = st.columns([1.1, 3, 1.2])
-                cur = str(row.get("메일카테고리", "") or MAIL_CATEGORIES[0])
-                e1.selectbox(
-                    "카테고리", MAIL_CATEGORIES,
-                    index=MAIL_CATEGORIES.index(cur) if cur in MAIL_CATEGORIES else 0,
-                    key=f"c_cat_{idx}", label_visibility="collapsed")
-                e2.text_area("요약", value=str(row.get("요약", "") or ""),
-                             key=f"c_sum_{idx}", height=70, label_visibility="collapsed")
-                e3.text_input("언론사", value=str(row.get("언론사", "") or ""),
-                              key=f"c_press_{idx}", label_visibility="collapsed")
-            st.divider()
-
-        applied = st.form_submit_button("💾 변경사항 적용", type="primary", **FULL_W)
-
-    if applied:
-        new_df = df.copy()
-        for idx in sub.index:
-            new_df.loc[idx, "선택"] = bool(st.session_state.get(f"c_sel_{idx}", False))
-            new_df.loc[idx, "메일카테고리"] = st.session_state.get(
-                f"c_cat_{idx}", new_df.loc[idx, "메일카테고리"])
-            new_df.loc[idx, "요약"] = st.session_state.get(f"c_sum_{idx}", "")
-            new_df.loc[idx, "언론사"] = st.session_state.get(f"c_press_{idx}", "")
-        st.session_state["editor_df"] = new_df
-        st.session_state["_flash"] = True
-        st.session_state["_flash_msg"] = f"✅ {len(sub)}건 반영 완료"
-        st.rerun()
-
-    return st.session_state["editor_df"]
-
-
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
@@ -1244,42 +1205,20 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     if st.session_state.pop("_flash", None):
         st.success(st.session_state.pop("_flash_msg", "완료"))
 
-    view_mode = st.radio(
-        "보기 방식", ["📊 표 보기 (빠른 일괄 편집)", "📝 카드 보기 (제목 100% 표시)"],
-        horizontal=True, index=0,
-        help="표에서 제목이 잘려 보이면 카드 보기를 쓰세요. 버전과 무관하게 항상 전체가 보입니다.")
-    card_mode = view_mode.startswith("📝")
-
-    vc1, vc2 = st.columns([1, 1])
-    with vc1:
-        compact = st.toggle("간략 보기 (키워드·발행시각 숨김 → 제목 넓게)",
-                            value=False, disabled=card_mode)
-    with vc2:
-        wrap_lines = st.select_slider("제목 표시 줄 수", options=[1, 2, 3, 4], value=2,
-                                      disabled=card_mode)
-
-    if not card_mode and not WRAP_OK:
-        st.info(f"ℹ️ 현재 Streamlit {st.__version__}은 표 내부 줄바꿈을 지원하지 않습니다. "
-                "제목 전체를 보려면 **카드 보기**를 선택하거나 "
-                "`requirements.txt`의 streamlit을 1.45 이상으로 올리세요.")
-
-    if compact:
-        order = ["선택", "메일카테고리", "제목", "요약", "언론사"]
-    else:
-        order = ["선택", "키워드", "메일카테고리", "제목", "요약", "언론사", "발행시각", "링크"]
-
-    editor_kwargs = dict(
+    edited_df = st.data_editor(
+        st.session_state["editor_df"],
         hide_index=True, **FULL_W, height=460,
-        column_order=order,
+        column_order=["선택", "키워드", "메일카테고리", "제목", "요약",
+                      "언론사", "발행시각", "링크"],
         column_config={
             "선택": st.column_config.CheckboxColumn("선택", width="small"),
-            "키워드": st.column_config.TextColumn("키워드", width=col_width(120, "small")),
+            "키워드": st.column_config.TextColumn("키워드", width=col_width(110, "small")),
             "메일카테고리": st.column_config.SelectboxColumn(
                 "메일 카테고리", options=MAIL_CATEGORIES, width=col_width(110, "small")),
-            "제목": st.column_config.TextColumn("제목", width=col_width(620 if compact else 480)),
-            "요약": st.column_config.TextColumn("요약 (직접 수정)", width=col_width(420)),
-            "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width=col_width(130, "small")),
-            "발행시각": st.column_config.TextColumn("발행시각", width=col_width(130, "small")),
+            "제목": st.column_config.TextColumn("제목", width=col_width(500)),
+            "요약": st.column_config.TextColumn("요약 (직접 수정)", width=col_width(400)),
+            "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width=col_width(120, "small")),
+            "발행시각": st.column_config.TextColumn("발행시각", width=col_width(125, "small")),
             "링크": st.column_config.LinkColumn("링크", display_text="열기",
                                               width=col_width(70, "small")),
             "요약초안": None, "카테고리": None, "네이버링크": None,
@@ -1287,26 +1226,11 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         disabled=["제목", "키워드", "발행시각", "링크"],
         key="editor",
     )
-    if ROW_HEIGHT_OK:
-        # Streamlit은 row_height가 4rem(64px)을 넘을 때만 셀 줄바꿈을 켠다.
-        editor_kwargs["row_height"] = 40 if wrap_lines == 1 else 24 + 30 * wrap_lines
-
-    if card_mode:
-        edited_df = render_card_editor(st.session_state["editor_df"])
-    else:
-        edited_df = st.data_editor(st.session_state["editor_df"], **editor_kwargs)
 
     sel = edited_df[edited_df["선택"] == True].copy()  # 원본 인덱스 유지
     st.write(f"선택된 기사: **{len(sel)}건**")
 
     if not sel.empty:
-        with st.expander(f"📄 선택한 기사 제목 전체 보기 ({len(sel)}건)"):
-            for _, r in sel.iterrows():
-                st.markdown(
-                    f"- [{r['제목']}]({r['링크']})  \n"
-                    f"  <span style='color:#888;font-size:12px'>{r.get('언론사','')} · "
-                    f"{r.get('발행시각','')}</span>", unsafe_allow_html=True)
-
         need_press = sel[sel["언론사"].astype(str).str.strip().isin(["", PRESS_PLACEHOLDER])]
         if not need_press.empty:
             st.warning(f"⚠️ 선택한 기사 중 {len(need_press)}건은 언론사가 비어 있습니다. "
@@ -1343,7 +1267,6 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             new_df.loc[idx, "언론사"] = press
         st.session_state["editor_df"] = new_df
         st.session_state.pop("editor", None)
-        clear_card_keys()
         st.session_state["_flash"] = True
         st.session_state["_flash_msg"] = f"✅ 언론사 {len(updates)}건 판별 완료"
         st.rerun()
@@ -1414,15 +1337,18 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         if not still_empty.empty:
             st.warning(f"⚠️ 언론사 미확인 {len(still_empty)}건 — 아래 표에서 직접 입력하세요.")
 
-        with st.expander("🏢 언론사·요약 확인", expanded=True):
-            st.dataframe(
-                sel_copy[["언론사", "제목", "요약"]],
-                hide_index=True, **FULL_W,
-                column_config={
-                    "언론사": st.column_config.TextColumn(width=col_width(130, "small")),
-                    "제목": st.column_config.TextColumn(width=col_width(430)),
-                    "요약": st.column_config.TextColumn(width=col_width(430)),
-                })
+        # 표는 제목이 잘리므로 전문 그대로 노출
+        with st.expander("🏢 언론사·제목·요약 전문 확인", expanded=True):
+            for _, r in sel_copy.iterrows():
+                st.markdown(f"**[{r['제목']}]({r['링크']})**")
+                for ln in str(r.get("요약", "") or "").split("\n"):
+                    if ln.strip():
+                        st.markdown(
+                            f"<div style='margin:0 0 2px 6px'>{html.escape(ln.strip())}</div>",
+                            unsafe_allow_html=True)
+                st.caption(f"{r.get('언론사', '')} · {r.get('메일카테고리', '')} · "
+                           f"{r.get('발행시각', '')}")
+                st.divider()
 
         if logs:
             st.warning(f"⚠️ {len(logs)}건 문제 발생 (첫 문장으로 대체됨)")
@@ -1442,7 +1368,6 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             back.loc[idx, "요약"] = sel_copy.loc[idx, "요약"]
             back.loc[idx, "언론사"] = sel_copy.loc[idx, "언론사"]
         st.session_state["editor_df"] = back
-        clear_card_keys()
 
         st.success("✅ 메일 본문이 생성되었습니다. (편집표에도 반영됨)")
 
