@@ -987,7 +987,40 @@ DEAD_MODEL_CODES = (400, 403, 404)
 MAX_OUTPUT_TOKENS = 800
 
 
-def _call_gemini(prompt: str, gemini_key: str, model_name: str):
+class RateLimiter:
+    """
+    분당 호출 수를 균등 간격으로 제한 (스레드 안전).
+    Gemini 무료 티어는 모델별 RPM 상한이 낮아, 병렬 5스레드로 몰아치면
+    바로 429가 난다. 호출 간격을 벌리고 429가 뜨면 전체를 잠시 멈춘다.
+    """
+
+    def __init__(self, rpm: int):
+        self.min_interval = 60.0 / max(int(rpm), 1)
+        self._lock = threading.Lock()
+        self._next = 0.0
+        self.throttled = False
+        self.wait_total = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next - now)
+            self._next = max(now, self._next) + self.min_interval
+        if wait > 0:
+            self.wait_total += wait
+            time.sleep(wait)
+
+    def penalize(self, seconds: float):
+        """429 발생 시 모든 워커를 함께 뒤로 미룬다."""
+        with self._lock:
+            self.throttled = True
+            self._next = max(self._next, time.monotonic() + seconds)
+
+
+RETRY_DELAY_RE = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
+
+
+def _call_gemini(prompt: str, gemini_key: str, model_name: str, limiter=None):
     """
     단일 호출 + 재시도. 반환: (원문텍스트, 에러, 모델폐기여부)
 
@@ -1007,8 +1040,11 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
 
     thinking_off = True
     last_err = ""
+    rate_hits = 0
 
-    for _ in range(3):
+    for attempt in range(5):
+        if limiter is not None:
+            limiter.acquire()
         try:
             r = requests.post(url, headers=headers, json=build(thinking_off), timeout=30)
         except Exception as e:
@@ -1038,8 +1074,20 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
                 return out, None, False
             return "", f"{model_name}: 빈 응답 (finishReason={finish or '?'})", False
 
-        if r.status_code in (429, 500, 503):
-            last_err = f"{model_name} HTTP {r.status_code} (재시도)"
+        if r.status_code == 429:
+            rate_hits += 1
+            m = RETRY_DELAY_RE.search(r.text)
+            delay = float(m.group(1)) if m else min(4 * (2 ** attempt), 40)
+            last_err = (f"{model_name}: 요청 한도 초과(429) · {delay:.0f}초 대기 후 재시도 "
+                        f"{rate_hits}회")
+            if limiter is not None:
+                limiter.penalize(delay)
+            else:
+                time.sleep(delay)
+            continue
+
+        if r.status_code in (500, 503):
+            last_err = f"{model_name} HTTP {r.status_code} (일시 오류, 재시도)"
             time.sleep(2.0)
             continue
 
@@ -1056,7 +1104,8 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
     return "", last_err or f"{model_name}: 알 수 없는 오류", False
 
 
-def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "ModelPicker"):
+def generate_summary_with_gemini(article_text: str, gemini_key: str,
+                                 picker: "ModelPicker", limiter=None):
     """
     명사형 1~2줄 요약 + 메일 카테고리 분류.
     사용 불가 모델(404 등)은 자동으로 건너뛰고 다음 후보로 폴백.
@@ -1077,7 +1126,7 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
         if not model_name:
             break
 
-        raw, err, dead = _call_gemini(prompt, gemini_key, model_name)
+        raw, err, dead = _call_gemini(prompt, gemini_key, model_name, limiter)
         if dead:
             picker.mark_dead(model_name, err)
             errors.append(err)
@@ -1086,8 +1135,10 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
             return "", "", err
 
         category, summary, has_verb = _postprocess_summary(raw)
-        if has_verb:  # 명사형 위반 → 강한 지시로 1회 재시도
-            raw2, _e2, _d2 = _call_gemini(prompt + STRICT_SUFFIX, gemini_key, model_name)
+        # 명사형 위반 시 재요청. 단 이미 429가 났다면 호출을 더 늘리지 않는다.
+        if has_verb and not (limiter is not None and limiter.throttled):
+            raw2, _e2, _d2 = _call_gemini(prompt + STRICT_SUFFIX, gemini_key,
+                                          model_name, limiter)
             if raw2:
                 cat2, summary2, has_verb2 = _postprocess_summary(raw2)
                 if summary2 and not has_verb2:
@@ -1099,7 +1150,7 @@ def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "Mo
     return "", "", "모든 모델 사용 불가 · " + " / ".join(errors[:2])
 
 
-def summarize_one(row_idx, url, gemini_key, picker, use_ai):
+def summarize_one(row_idx, url, gemini_key, picker, use_ai, limiter=None):
     """
     워커: 본문 추출 + 언론사·원문제목 판별 + 요약·분류 생성.
     반환: (idx, 카테고리, 요약, 언론사, 원문제목, 로그)
@@ -1111,7 +1162,8 @@ def summarize_one(row_idx, url, gemini_key, picker, use_ai):
     if not use_ai:
         return row_idx, "", first_sentence(text), press, page_title, None
 
-    category, summary, err = generate_summary_with_gemini(text, gemini_key, picker)
+    category, summary, err = generate_summary_with_gemini(
+        text, gemini_key, picker, limiter)
     if summary:
         return row_idx, category, summary, press, page_title, None
     return row_idx, category, first_sentence(text), press, page_title, \
@@ -1209,6 +1261,9 @@ with st.sidebar:
     st.divider()
     max_workers = st.slider("크롤링 동시 처리 수", 1, 8, 5,
                             help="높을수록 빠르지만 차단 위험 증가")
+    gemini_rpm = st.slider("Gemini 분당 요청 한도(RPM)", 4, 60, 12,
+                           help="429(요청 한도 초과)가 나면 이 값을 낮추세요. "
+                                "무료 티어는 모델에 따라 10~15가 안전합니다.")
 
     st.divider()
     st.write("**카테고리 선택**")
@@ -1456,9 +1511,10 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 use_ai = False
             else:
                 picker = ModelPicker(cand)
-                st.info(f"Gemini 1순위 모델: `{cand[0]}`"
-                        + (f" (실패 시 {len(cand) - 1}개 후보로 자동 폴백)" if len(cand) > 1 else ""))
+                st.info(f"Gemini 모델 `{cand[0]}` · 분당 {gemini_rpm}회 제한으로 호출"
+                        + (f" (실패 시 후보 {len(cand) - 1}개로 자동 폴백)" if len(cand) > 1 else ""))
 
+        limiter = RateLimiter(gemini_rpm) if use_ai else None
         sel_copy = sel.copy()  # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
         logs, ok, press_filled, title_fixed, cat_ai = [], 0, 0, 0, 0
@@ -1467,7 +1523,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [
                 ex.submit(summarize_one, i, str(r.get("링크", "")),
-                          gemini_key, picker, use_ai)
+                          gemini_key, picker, use_ai, limiter)
                 for i, r in sel_copy.iterrows() if str(r.get("링크", ""))
             ]
             for n, fut in enumerate(as_completed(futures), start=1):
@@ -1514,6 +1570,12 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
         if not still_empty.empty:
             st.warning(f"⚠️ 언론사 미확인 {len(still_empty)}건 — 메일 본문에서 직접 수정하세요.")
+
+        if limiter is not None and limiter.throttled:
+            st.error(
+                f"🚦 Gemini 요청 한도(429)에 걸렸습니다. 사이드바의 "
+                f"**Gemini 분당 요청 한도**를 현재 {gemini_rpm} → 6~8 정도로 낮추고 "
+                "다시 실행해 보세요. 실패한 기사만 다시 선택해 돌리면 됩니다.")
 
         if logs:
             st.warning(f"⚠️ {len(logs)}건 문제 발생 (첫 문장으로 대체됨)")
