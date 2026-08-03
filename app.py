@@ -10,6 +10,7 @@ import re
 import time
 import html
 import inspect as _inspect
+import threading
 import datetime as dt
 import urllib.parse
 from difflib import SequenceMatcher
@@ -87,6 +88,9 @@ try:
     ROW_HEIGHT_OK = "row_height" in _inspect.signature(st.data_editor).parameters
 except Exception:
     ROW_HEIGHT_OK = False
+
+# 표 셀 줄바꿈(allowWrapping)은 row_height가 4rem을 넘을 때만 켜지며 1.45+ 에서만 구현됨
+WRAP_OK = ROW_HEIGHT_OK and _st_version() >= (1, 45)
 
 
 def _full_width_kwargs():
@@ -680,11 +684,36 @@ def _postprocess_summary(raw: str):
     return "\n".join(lines), any(VERB_END_RE.search(l) for l in lines)
 
 BAD_MODEL_TOKENS = ("embedding", "aqa", "vision", "imagen", "tts", "live",
-                    "gemma", "image", "veo", "learnlm")
+                    "gemma", "image", "veo", "learnlm", "thinking")
+
+
+def model_score(n: str) -> float:
+    """
+    선호도 점수. 버전 숫자를 직접 파싱해 신모델이 나와도 자동으로 상위 랭크.
+    flash-lite 계열은 신규 사용자 404가 잦아 후순위로 내림.
+    """
+    low = n.lower()
+    s = 0.0
+    if "flash" in low:
+        s += 20
+    if "pro" in low:
+        s += 8
+    if "lite" in low:
+        s -= 10          # 404 다발 → 후순위
+    if "latest" in low:
+        s += 5
+    if "exp" in low or "preview" in low or re.search(r"-\d{3,4}$", low):
+        s -= 8           # 실험판·날짜 스냅샷 후순위
+    m = re.search(r"(\d+)\.(\d+)", low)
+    if m:
+        s += int(m.group(1)) * 3 + int(m.group(2)) * 0.3
+    else:
+        s += 4           # gemini-flash-latest 처럼 버전 없는 별칭
+    return s
 
 
 def list_gemini_models(gemini_key: str):
-    """이 키로 generateContent 가능한 모델 목록 조회. 반환: (모델리스트, 에러)"""
+    """generateContent 가능한 모델을 선호도 순으로 반환. 반환: (모델리스트, 에러)"""
     if not gemini_key:
         return [], "GEMINI_API_KEY 없음"
     try:
@@ -708,43 +737,57 @@ def list_gemini_models(gemini_key: str):
     if not usable:
         return [], "generateContent 지원 모델 없음"
 
-    def score(n):
-        s = 0
-        if "flash" in n:
-            s += 20
-        if "lite" in n:
-            s += 3          # flash-lite: 빠르고 저렴
-        if "2.5" in n:
-            s += 8
-        elif "2.0" in n:
-            s += 6
-        elif "1.5" in n:
-            s -= 5
-        if "latest" in n:
-            s += 2
-        if "exp" in n or "preview" in n or "thinking" in n:
-            s -= 6
-        return s
-
-    usable.sort(key=score, reverse=True)
+    usable.sort(key=model_score, reverse=True)
     return usable, None
 
 
-def resolve_gemini_model(gemini_key: str):
-    """성공 결과만 세션에 캐시 (실패를 1시간 캐싱하던 문제 해결)."""
-    cached = st.session_state.get("_gemini_model")
+class ModelPicker:
+    """
+    listModels에는 뜨지만 generateContent는 404를 주는 모델이 존재한다.
+    (예: 'no longer available to new users')
+    실제 호출이 실패한 모델을 즉시 제외하고 다음 후보로 넘어간다. 스레드 안전.
+    """
+
+    def __init__(self, candidates):
+        self.candidates = [c for c in candidates if c]
+        self.dead = {}
+        self._lock = threading.Lock()
+
+    def current(self):
+        with self._lock:
+            for m in self.candidates:
+                if m not in self.dead:
+                    return m
+        return ""
+
+    def mark_dead(self, model, reason=""):
+        with self._lock:
+            if model and model not in self.dead:
+                self.dead[model] = reason
+
+    def alive(self):
+        with self._lock:
+            return [m for m in self.candidates if m not in self.dead]
+
+
+def resolve_gemini_candidates(gemini_key: str):
+    """성공 결과만 세션 캐시. 반환: (후보리스트, 에러)"""
+    cached = st.session_state.get("_gemini_model_list")
     if cached:
         return cached, None
     models, err = list_gemini_models(gemini_key)
     if not models:
-        return "", err
-    st.session_state["_gemini_model"] = models[0]
+        return [], err
     st.session_state["_gemini_model_list"] = models
-    return models[0], None
+    st.session_state.setdefault("_gemini_model", models[0])
+    return models, None
+
+
+DEAD_MODEL_CODES = (400, 403, 404)
 
 
 def _call_gemini(prompt: str, gemini_key: str, model_name: str):
-    """단일 호출 + 재시도. 반환: (원문텍스트, 에러)"""
+    """단일 호출 + 재시도. 반환: (원문텍스트, 에러, 모델폐기여부)"""
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 300, "temperature": 0.3},
@@ -766,56 +809,70 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
             candidates = data.get("candidates", [])
             if not candidates:
                 fb = data.get("promptFeedback", {})
-                return "", f"{model_name}: 후보 없음 (blockReason={fb.get('blockReason', '?')})"
+                return "", f"{model_name}: 후보 없음 (blockReason={fb.get('blockReason', '?')})", False
             cand = candidates[0]
             parts = cand.get("content", {}).get("parts", [])
             out = "".join(p.get("text", "") for p in parts).strip()
             if out:
-                return out, None
-            return "", f"{model_name}: 빈 응답 (finishReason={cand.get('finishReason', '?')})"
+                return out, None, False
+            return "", f"{model_name}: 빈 응답 (finishReason={cand.get('finishReason', '?')})", False
 
         if r.status_code in (429, 500, 503):
             last_err = f"{model_name} HTTP {r.status_code} (재시도)"
             time.sleep(2.0)
             continue
 
-        return "", f"{model_name} HTTP {r.status_code}: {r.text[:150]}"
+        # 400/403/404 → 이 모델은 이 키로 사용 불가. 다음 후보로 넘긴다.
+        msg = re.sub(r"\s+", " ", r.text)[:160]
+        return "", f"{model_name} HTTP {r.status_code}: {msg}", r.status_code in DEAD_MODEL_CODES
 
-    return "", last_err or "알 수 없는 오류"
+    return "", last_err or "알 수 없는 오류", False
 
 
-def generate_summary_with_gemini(article_text: str, gemini_key: str, model_name: str = ""):
-    """명사형 1~2줄 요약 생성. 동사형이 섞이면 1회 재요청. 반환: (요약, 에러)"""
+def generate_summary_with_gemini(article_text: str, gemini_key: str, picker: "ModelPicker"):
+    """
+    명사형 1~2줄 요약 생성.
+    사용 불가 모델(404 등)은 자동으로 건너뛰고 다음 후보로 폴백.
+    동사형 어미가 섞이면 1회 재요청. 반환: (요약, 에러)
+    """
     if not gemini_key:
         return "", "GEMINI_API_KEY 없음"
     if not article_text:
         return "", "본문 없음"
-
-    if not model_name:
-        model_name, err = resolve_gemini_model(gemini_key)
-        if not model_name:
-            return "", f"모델 선택 실패: {err}"
+    if picker is None or not picker.current():
+        return "", "사용 가능한 Gemini 모델 없음"
 
     prompt = GEMINI_PROMPT.format(text=article_text[:2500])
-    raw, err = _call_gemini(prompt, gemini_key, model_name)
-    if not raw:
-        return "", err
+    errors = []
 
-    summary, has_verb = _postprocess_summary(raw)
+    for _ in range(4):  # 최대 4개 모델까지 폴백
+        model_name = picker.current()
+        if not model_name:
+            break
 
-    if has_verb:  # 명사형 위반 → 강한 지시로 1회 재시도
-        raw2, _ = _call_gemini(prompt + STRICT_SUFFIX, gemini_key, model_name)
-        if raw2:
-            summary2, has_verb2 = _postprocess_summary(raw2)
-            if summary2 and not has_verb2:
-                return summary2, None
+        raw, err, dead = _call_gemini(prompt, gemini_key, model_name)
+        if dead:
+            picker.mark_dead(model_name, err)
+            errors.append(err)
+            continue
+        if not raw:
+            return "", err
 
-    if not summary:
+        summary, has_verb = _postprocess_summary(raw)
+        if has_verb:  # 명사형 위반 → 강한 지시로 1회 재시도
+            raw2, _e2, _d2 = _call_gemini(prompt + STRICT_SUFFIX, gemini_key, model_name)
+            if raw2:
+                summary2, has_verb2 = _postprocess_summary(raw2)
+                if summary2 and not has_verb2:
+                    return summary2, None
+        if summary:
+            return summary, None
         return "", f"{model_name}: 후처리 후 빈 결과"
-    return summary, None
+
+    return "", "모든 모델 사용 불가 · " + " / ".join(errors[:2])
 
 
-def summarize_one(row_idx, url, gemini_key, model_name, use_ai):
+def summarize_one(row_idx, url, gemini_key, picker, use_ai):
     """워커: 본문 추출 + 언론사 판별 + 요약 생성. 반환: (idx, 요약, 언론사, 로그)"""
     text, extractor, final_url, press = fetch_article(url)
     if not text:
@@ -824,7 +881,7 @@ def summarize_one(row_idx, url, gemini_key, model_name, use_ai):
     if not use_ai:
         return row_idx, first_sentence(text), press, None
 
-    summary, err = generate_summary_with_gemini(text, gemini_key, model_name)
+    summary, err = generate_summary_with_gemini(text, gemini_key, picker)
     if summary:
         return row_idx, summary, press, None
     return row_idx, first_sentence(text), press, f"[Gemini실패/{extractor}] {err}"
@@ -888,20 +945,35 @@ with st.sidebar:
     st.divider()
     st.write("**AI 요약 (Gemini)**")
     gemini_key = get_secret("GEMINI_API_KEY")
+    model_override = ""
     if gemini_key:
         use_gemini = st.checkbox("Gemini로 요약", value=True)
-        if st.button("🔌 Gemini 연결 테스트", **FULL_W):
+
+        if st.button("🔌 모델 목록 새로고침 / 연결 테스트", **FULL_W):
+            for k in ("_gemini_model_list", "_gemini_model", "_gemini_dead"):
+                st.session_state.pop(k, None)
             models, err = list_gemini_models(gemini_key)
             if models:
-                st.session_state["_gemini_model"] = models[0]
-                st.success(f"✓ 연결 성공 · 사용 모델: **{models[0]}**")
-                with st.expander("사용 가능 모델 전체"):
-                    st.write(models[:15])
+                st.session_state["_gemini_model_list"] = models
+                st.success(f"✓ 연결 성공 · 후보 {len(models)}개")
             else:
                 st.error(f"✗ {err}")
-        active = st.session_state.get("_gemini_model")
-        if active:
-            st.caption(f"모델: `{active}`")
+
+        cand, cerr = resolve_gemini_candidates(gemini_key)
+        if cand:
+            model_override = st.selectbox(
+                "사용 모델", ["자동 (권장)"] + cand, index=0,
+                help="자동 선택 시 사용 불가(404) 모델은 건너뛰고 다음 후보로 넘어갑니다.")
+            model_override = "" if model_override == "자동 (권장)" else model_override
+            st.caption(f"1순위 후보: `{cand[0]}`")
+        elif cerr:
+            st.caption(f"⚠️ {cerr}")
+
+        dead = st.session_state.get("_gemini_dead") or {}
+        if dead:
+            with st.expander(f"🚫 사용 불가 판정 모델 {len(dead)}개"):
+                for m, why in dead.items():
+                    st.text(f"{m}\n  └ {why[:110]}")
     else:
         use_gemini = False
         st.warning("⚠️ GEMINI_API_KEY 미설정\n\n"
@@ -1072,6 +1144,84 @@ def build_mail_html(sel_df):
     return "".join(parts)
 
 
+CARD_PER_PAGE = 20
+
+
+def clear_card_keys():
+    """편집표를 프로그램이 갱신했을 때 카드 위젯의 낡은 값 제거."""
+    for k in [k for k in list(st.session_state.keys()) if k.startswith("c_")]:
+        st.session_state.pop(k, None)
+
+
+def render_card_editor(df):
+    """
+    제목이 절대 잘리지 않는 카드형 편집 UI (Streamlit 버전 무관).
+    반환: 현재 편집표 DataFrame
+    """
+    f1, f2 = st.columns([3, 1])
+    q = f1.text_input("제목 검색", key="card_q", placeholder="예: 물류센터, 이지스…")
+    only_sel = f2.checkbox("선택한 기사만", key="card_only_sel")
+
+    view = df
+    if q and q.strip():
+        view = view[view["제목"].astype(str).str.contains(q.strip(), case=False, na=False)]
+    if only_sel:
+        view = view[view["선택"] == True]
+
+    total = len(view)
+    pages = max((total - 1) // CARD_PER_PAGE + 1, 1)
+    page = 1
+    if pages > 1:
+        page = int(st.number_input(f"페이지 (총 {pages}쪽 · {total}건)",
+                                   min_value=1, max_value=pages, value=1, key="card_page"))
+    page = min(page, pages)
+    sub = view.iloc[(page - 1) * CARD_PER_PAGE: page * CARD_PER_PAGE]
+
+    if sub.empty:
+        st.info("조건에 맞는 기사가 없습니다.")
+        return df
+
+    st.caption("체크 → 카테고리·요약·언론사 수정 → 맨 아래 **[변경사항 적용]** 클릭 "
+               "(적용 전까지는 저장되지 않습니다)")
+
+    with st.form("card_form"):
+        for idx, row in sub.iterrows():
+            c1, c2 = st.columns([0.05, 0.95])
+            c1.checkbox("선택", key=f"c_sel_{idx}", value=bool(row["선택"]),
+                        label_visibility="collapsed")
+            with c2:
+                st.markdown(f"**[{row['제목']}]({row['링크']})**")
+                st.caption(f"{row.get('키워드', '')} · {row.get('발행시각', '')}")
+                e1, e2, e3 = st.columns([1.1, 3, 1.2])
+                cur = str(row.get("메일카테고리", "") or MAIL_CATEGORIES[0])
+                e1.selectbox(
+                    "카테고리", MAIL_CATEGORIES,
+                    index=MAIL_CATEGORIES.index(cur) if cur in MAIL_CATEGORIES else 0,
+                    key=f"c_cat_{idx}", label_visibility="collapsed")
+                e2.text_area("요약", value=str(row.get("요약", "") or ""),
+                             key=f"c_sum_{idx}", height=70, label_visibility="collapsed")
+                e3.text_input("언론사", value=str(row.get("언론사", "") or ""),
+                              key=f"c_press_{idx}", label_visibility="collapsed")
+            st.divider()
+
+        applied = st.form_submit_button("💾 변경사항 적용", type="primary", **FULL_W)
+
+    if applied:
+        new_df = df.copy()
+        for idx in sub.index:
+            new_df.loc[idx, "선택"] = bool(st.session_state.get(f"c_sel_{idx}", False))
+            new_df.loc[idx, "메일카테고리"] = st.session_state.get(
+                f"c_cat_{idx}", new_df.loc[idx, "메일카테고리"])
+            new_df.loc[idx, "요약"] = st.session_state.get(f"c_sum_{idx}", "")
+            new_df.loc[idx, "언론사"] = st.session_state.get(f"c_press_{idx}", "")
+        st.session_state["editor_df"] = new_df
+        st.session_state["_flash"] = True
+        st.session_state["_flash_msg"] = f"✅ {len(sub)}건 반영 완료"
+        st.rerun()
+
+    return st.session_state["editor_df"]
+
+
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
@@ -1094,11 +1244,24 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     if st.session_state.pop("_flash", None):
         st.success(st.session_state.pop("_flash_msg", "완료"))
 
+    view_mode = st.radio(
+        "보기 방식", ["📊 표 보기 (빠른 일괄 편집)", "📝 카드 보기 (제목 100% 표시)"],
+        horizontal=True, index=0,
+        help="표에서 제목이 잘려 보이면 카드 보기를 쓰세요. 버전과 무관하게 항상 전체가 보입니다.")
+    card_mode = view_mode.startswith("📝")
+
     vc1, vc2 = st.columns([1, 1])
     with vc1:
-        compact = st.toggle("간략 보기 (키워드·발행시각 숨김 → 제목 넓게)", value=False)
+        compact = st.toggle("간략 보기 (키워드·발행시각 숨김 → 제목 넓게)",
+                            value=False, disabled=card_mode)
     with vc2:
-        wrap_lines = st.select_slider("제목 표시 줄 수", options=[1, 2, 3], value=2)
+        wrap_lines = st.select_slider("제목 표시 줄 수", options=[1, 2, 3, 4], value=2,
+                                      disabled=card_mode)
+
+    if not card_mode and not WRAP_OK:
+        st.info(f"ℹ️ 현재 Streamlit {st.__version__}은 표 내부 줄바꿈을 지원하지 않습니다. "
+                "제목 전체를 보려면 **카드 보기**를 선택하거나 "
+                "`requirements.txt`의 streamlit을 1.45 이상으로 올리세요.")
 
     if compact:
         order = ["선택", "메일카테고리", "제목", "요약", "언론사"]
@@ -1125,9 +1288,13 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         key="editor",
     )
     if ROW_HEIGHT_OK:
-        editor_kwargs["row_height"] = 26 + 22 * wrap_lines
+        # Streamlit은 row_height가 4rem(64px)을 넘을 때만 셀 줄바꿈을 켠다.
+        editor_kwargs["row_height"] = 40 if wrap_lines == 1 else 24 + 30 * wrap_lines
 
-    edited_df = st.data_editor(st.session_state["editor_df"], **editor_kwargs)
+    if card_mode:
+        edited_df = render_card_editor(st.session_state["editor_df"])
+    else:
+        edited_df = st.data_editor(st.session_state["editor_df"], **editor_kwargs)
 
     sel = edited_df[edited_df["선택"] == True].copy()  # 원본 인덱스 유지
     st.write(f"선택된 기사: **{len(sel)}건**")
@@ -1176,20 +1343,27 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             new_df.loc[idx, "언론사"] = press
         st.session_state["editor_df"] = new_df
         st.session_state.pop("editor", None)
+        clear_card_keys()
         st.session_state["_flash"] = True
         st.session_state["_flash_msg"] = f"✅ 언론사 {len(updates)}건 판별 완료"
         st.rerun()
 
     if make_mail:
         use_ai = bool(use_gemini and gemini_key)
-        model_name = ""
+        picker = None
         if use_ai:
-            model_name, merr = resolve_gemini_model(gemini_key)
-            if not model_name:
-                st.error(f"Gemini 모델 확인 실패 → 첫 문장 요약으로 대체합니다. ({merr})")
+            if model_override:
+                cand = [model_override]
+                cerr = None
+            else:
+                cand, cerr = resolve_gemini_candidates(gemini_key)
+            if not cand:
+                st.error(f"Gemini 모델 확인 실패 → 첫 문장 요약으로 대체합니다. ({cerr})")
                 use_ai = False
             else:
-                st.info(f"Gemini 모델: `{model_name}`")
+                picker = ModelPicker(cand)
+                st.info(f"Gemini 1순위 모델: `{cand[0]}`"
+                        + (f" (실패 시 {len(cand) - 1}개 후보로 자동 폴백)" if len(cand) > 1 else ""))
 
         sel_copy = sel.copy()  # 원본 인덱스 유지 → 편집표에 되돌려쓰기 가능
         prog = st.progress(0.0, text="본문 크롤링 및 요약 생성 중...")
@@ -1199,7 +1373,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [
                 ex.submit(summarize_one, i, str(r.get("링크", "")),
-                          gemini_key, model_name, use_ai)
+                          gemini_key, picker, use_ai)
                 for i, r in sel_copy.iterrows() if str(r.get("링크", ""))
             ]
             for n, fut in enumerate(as_completed(futures), start=1):
@@ -1223,6 +1397,17 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         label = "Gemini 요약" if use_ai else "첫 문장 요약"
         st.write(f"**결과:** ✓ {ok}/{total_n}건 {label} 성공"
                  + (f" · 언론사 {press_filled}건 자동 보완" if press_filled else ""))
+
+        if picker is not None:
+            if picker.dead:
+                st.session_state["_gemini_dead"] = dict(picker.dead)
+                st.warning(f"🚫 사용 불가 모델 {len(picker.dead)}개를 건너뛰었습니다 → "
+                           f"실제 사용: `{picker.current() or '없음'}`")
+                with st.expander("건너뛴 모델"):
+                    for m, why in picker.dead.items():
+                        st.text(f"{m}\n  └ {why[:140]}")
+            if picker.current():
+                st.session_state["_gemini_model"] = picker.current()
 
         still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
                                .isin(["", PRESS_PLACEHOLDER, "nan"])]
@@ -1257,6 +1442,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             back.loc[idx, "요약"] = sel_copy.loc[idx, "요약"]
             back.loc[idx, "언론사"] = sel_copy.loc[idx, "언론사"]
         st.session_state["editor_df"] = back
+        clear_card_keys()
 
         st.success("✅ 메일 본문이 생성되었습니다. (편집표에도 반영됨)")
 
