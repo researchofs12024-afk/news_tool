@@ -1,8 +1,9 @@
-streamlit>=1.28
-requests
-feedparser
-pandas
-openpyxl
-newspaper3k
-trafilatura
-beautifulsoup4
+streamlit>=1.36
+requests>=2.31
+pandas>=2.0
+openpyxl>=3.1
+beautifulsoup4>=4.12
+lxml>=5.0
+trafilatura>=1.8
+newspaper3k>=0.2.8
+lxml_html_clean>=0.1.1
