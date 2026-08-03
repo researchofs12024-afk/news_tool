@@ -275,11 +275,14 @@ def fetch_naver(keyword, category, cid, csecret, hours_limit, max_pages=10, diag
                 stop = True
                 break
             link = it.get("originallink") or it.get("link", "")
+            press = press_from_link(link)
+            raw_title = clean(it.get("title", ""))
             rows.append({
                 "카테고리": category,
                 "키워드": keyword,
-                "제목": clean(it.get("title", "")),
-                "언론사": press_from_link(link),
+                # 말머리 태그·언론사 꼬리표를 떼고 순수 제목만 저장
+                "제목": _clean_title(raw_title, press) or raw_title,
+                "언론사": press,
                 "발행시각": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
                 "링크": link,
                 "네이버링크": it.get("link", ""),
@@ -517,28 +520,91 @@ TRUNC_RE = re.compile(r"(\.\.\.+|…+|‥+)\s*$")
 TITLE_TAIL_SEPS = (" - ", " | ", " < ", " :: ", " > ", " – ", " — ")
 
 
-def _clean_title(t: str) -> str:
+# 제목 앞뒤에 붙는 말머리 태그: [유교신문], (종합), 【단독】 …
+LEAD_TAG_RE = re.compile(r"^\s*[\[\(<【〔]\s*([^\]\)>】〕]{1,24})\s*[\]\)>】〕]\s*")
+TAIL_TAG_RE = re.compile(r"\s*[\[\(<【〔]\s*([^\]\)>】〕]{1,24})\s*[\]\)>】〕]\s*$")
+
+# 꼬리에 붙은 언론사명 판별용
+PRESS_NAME_SET = set(PRESS_DOMAIN_MAP.values())
+PRESS_LIKE_RE = re.compile(
+    r"(신문|일보|경제|뉴스|타임스|저널|투데이|미디어|방송|데일리|헤럴드|포스트|"
+    r"통신|리포트|매거진|TV|News|Times|Post|Daily)$", re.I)
+
+
+def _is_press_like(s: str) -> bool:
+    s = (s or "").strip()
+    if not s or len(s) > 15:
+        return False
+    return s in PRESS_NAME_SET or bool(PRESS_LIKE_RE.search(s))
+
+
+def strip_decor_tags(title: str) -> str:
+    """
+    제목 앞뒤의 말머리 태그를 모두 제거.
+    [유교신문], [유교경영리포트], [단독], [속보], (종합), <상> 등.
+    """
+    t = (title or "").strip()
+    for _ in range(5):                       # 태그가 겹쳐 붙는 경우 대비
+        before = t
+        m = LEAD_TAG_RE.match(t)
+        if m:
+            cand = t[m.end():].strip()
+            if len(cand) >= 10:
+                t = cand
+        m = TAIL_TAG_RE.search(t)
+        if m:
+            cand = t[:m.start()].strip()
+            if len(cand) >= 10:
+                t = cand
+        if t == before:
+            break
+    return t
+
+
+def strip_press_suffix(title: str, press: str = "") -> str:
+    """'제목 | 연합뉴스' 처럼 꼬리에 붙은 언론사명 제거."""
+    t = (title or "").strip()
+    for _ in range(2):
+        before = t
+        for sep in TITLE_TAIL_SEPS:
+            if sep in t:
+                head, tail = t.rsplit(sep, 1)
+                head, tail = head.strip(), tail.strip()
+                if len(head) >= 10 and (
+                        (press and tail == press.strip()) or _is_press_like(tail)):
+                    t = head
+                    break
+        if t == before:
+            break
+    return t
+
+
+def _clean_title(t: str, press: str = "") -> str:
+    """공백 정리 → 언론사 꼬리표 제거 → 말머리 태그 제거."""
     if not t:
         return ""
     t = re.sub(r"\s+", " ", html.unescape(str(t))).strip().strip("\"'“”‘’")
+    t = strip_press_suffix(t, press)
+    t = strip_decor_tags(t)
+    t = strip_press_suffix(t, press)   # 태그 제거 후 꼬리표가 드러나는 경우
     return t[:200] if len(t) >= 8 else ""
 
 
-def title_from_html(soup) -> str:
+def title_from_html(soup, press: str = "") -> str:
     """og:title → twitter:title → h1 → <title> 순으로 기사 원문 제목 추출."""
     for sel, attr in [('meta[property="og:title"]', "content"),
                       ('meta[name="twitter:title"]', "content"),
                       ('meta[name="title"]', "content")]:
         tag = soup.select_one(sel)
         if tag:
-            v = _clean_title(tag.get(attr, ""))
+            v = _clean_title(tag.get(attr, ""), press)
             if v and not TRUNC_RE.search(v):
                 return v
 
     for sel in ("h1.headline", "h1#title", "h1", ".article-head-title", "#articleTitle"):
         tag = soup.select_one(sel)
         if tag:
-            v = _clean_title(tag.get_text())
+            v = _clean_title(tag.get_text(), press)
             if v and not TRUNC_RE.search(v):
                 return v
 
@@ -546,13 +612,7 @@ def title_from_html(soup) -> str:
         raw = soup.title.string if soup.title else ""
     except Exception:
         raw = ""
-    v = _clean_title(raw)
-    for sep in TITLE_TAIL_SEPS:          # "제목 - 언론사" 꼬리표 제거
-        if sep in v:
-            head = v.rsplit(sep, 1)[0].strip()
-            if len(head) >= 10:
-                v = head
-                break
+    v = _clean_title(raw, press)
     return "" if TRUNC_RE.search(v) else v
 
 
@@ -586,7 +646,7 @@ def parse_body_with_bs4(raw_html: str):
         soup = BeautifulSoup(raw_html, "html.parser")
         # decompose 전에 먼저 추출 (h1/header가 제거 대상에 포함되므로)
         press = press_from_html(soup)
-        page_title = title_from_html(soup)
+        page_title = title_from_html(soup, press)
 
         for selector in DROP_SELECTORS:
             for el in soup.select(selector):
