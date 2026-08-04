@@ -365,6 +365,125 @@ def dedup(df, title_sim_threshold=0.65, word_sim_threshold=0.6, progress_bar=Non
 
 
 # ══════════════════════════════════════════════════════════════
+# 관련성 필터 (상업용 부동산 / 기관투자 / 부동산금융 / 정책)
+# ══════════════════════════════════════════════════════════════
+# 제목에 있으면 무조건 관련 기사로 취급하는 강신호
+STRONG_POS = (
+    "오피스", "물류센터", "데이터센터", "지식산업센터", "리츠", "자산운용",
+    "매각주관", "사옥", "상업용", "공실률", "캡레이트", "부동산펀드",
+    "기관투자자", "연기금", "임대차", "프라임", "빌딩", "복합개발",
+)
+
+POS_TERMS = [
+    ("오피스", 4), ("물류센터", 4), ("데이터센터", 4), ("지식산업센터", 4),
+    ("리츠", 4), ("자산운용", 4), ("매각주관", 4), ("사옥", 4), ("상업용", 4),
+    ("공실", 4), ("캡레이트", 4), ("부동산펀드", 4), ("기관투자자", 4),
+    ("연기금", 4), ("임대차", 4), ("프라임", 3), ("빌딩", 3), ("복합개발", 3),
+    ("리테일", 3), ("상권", 3), ("호텔", 2), ("임대료", 3), ("수익률", 2),
+    ("우선협상", 3), ("클로징", 3), ("실사", 2), ("주관사", 3), ("신탁", 3),
+    ("PF", 3), ("프로젝트파이낸싱", 3), ("브릿지론", 3), ("메자닌", 3),
+    ("블라인드펀드", 3), ("운용사", 3), ("투자자", 2), ("리모델링", 2),
+    ("착공", 2), ("준공", 2), ("인허가", 2), ("부지", 2), ("본사 이전", 3),
+    ("임차", 3), ("입주", 2), ("매각", 2), ("매입", 2), ("인수", 1),
+    ("거래", 1), ("펀드", 2), ("국토부", 2), ("국토교통부", 2), ("세제", 2),
+    ("규제 완화", 2), ("부동산 정책", 3), ("금융당국", 2), ("보험사", 1),
+    ("증권사", 1), ("개발사업", 3), ("시행사", 3), ("디벨로퍼", 3),
+]
+
+NEG_TERMS = [
+    # 주거용 · 개인 재테크
+    ("분양", 5), ("청약", 5), ("입주자모집", 5), ("전세사기", 5), ("갭투자", 5),
+    ("빌라", 4), ("다세대", 4), ("아파트값", 5), ("집값", 4), ("전셋값", 4),
+    ("분양가", 4), ("모델하우스", 5), ("견본주택", 5), ("신혼부부", 4),
+    ("임대주택", 3), ("공공주택", 3), ("아파트", 3), ("주택담보", 3),
+    ("재건축", 2), ("재개발", 2), ("월세", 2), ("이사", 2),
+    # 무관 분야
+    ("연예", 5), ("배우", 5), ("가수", 5), ("아이돌", 5), ("드라마", 4),
+    ("예능", 5), ("프로야구", 5), ("축구", 4), ("골프", 3), ("날씨", 5),
+    ("코인", 4), ("비트코인", 5), ("특징주", 5), ("상한가", 5), ("급등주", 5),
+    ("종목추천", 5), ("부고", 5), ("화보", 5), ("음주운전", 5), ("마약", 5),
+    ("성폭행", 5), ("이혼", 4), ("복권", 5), ("로또", 5), ("맛집", 5),
+    ("건강", 3), ("다이어트", 5), ("채용공고", 4), ("장학금", 4),
+]
+
+
+def relevance_score(title: str, desc: str = "") -> int:
+    """제목 가중 2배 + 발췌문으로 상업용 부동산 관련도 점수 산출."""
+    t = str(title or "")
+    text = f"{t} {t} {str(desc or '')}"
+    pos = sum(w for term, w in POS_TERMS if term in text)
+    neg = sum(w for term, w in NEG_TERMS if term in text)
+    score = pos - neg
+    if any(term in t for term in STRONG_POS):
+        score += 4          # 핵심 자산군이 제목에 있으면 함부로 버리지 않는다
+    return int(score)
+
+
+FILTER_LEVELS = {
+    "약하게 (명백한 것만 제외)": -6,
+    "보통 (권장)": -1,
+    "강하게 (애매하면 제외)": 3,
+}
+
+# 이 점수 미만이면 AI 재판정 대상 (명백히 관련된 기사는 호출 낭비 방지)
+AI_CHECK_BELOW = 8
+
+AI_RELEVANCE_PROMPT = """아래는 뉴스 제목 목록이다. 이 중에서 '상업용 부동산' 업계
+종사자에게 의미 있는 기사만 골라라.
+
+관련 있음: 오피스·물류센터·데이터센터·리테일·호텔 등 상업용 부동산의 매매·개발·
+임대차·시장동향 / 리츠·부동산펀드·자산운용사·기관투자자의 부동산 투자 /
+부동산 PF·신탁·대출 등 부동산금융 / 부동산 관련 정부 정책·규제·세제
+
+관련 없음: 아파트 분양·청약·전세 등 주거용 / 개인 재테크 / 부동산과 무관한
+기업 실적·인사 / 연예·스포츠·사건사고 / 주식 종목 기사
+
+목록:
+{items}
+
+관련 있는 항목의 번호만 쉼표로 구분해 출력하라. 다른 말은 쓰지 마라.
+예시 출력: 1,3,4,9"""
+
+
+def ai_relevance_check(titles, gemini_key, picker, batch=40):
+    """
+    제목을 묶어 Gemini에 관련성 판정 요청.
+    반환: (관련 있다고 판정된 위치 집합, 에러목록)
+    판정 실패한 배치는 전부 '관련'으로 간주해 기사를 잃지 않는다.
+    """
+    keep, errors = set(), []
+    for start in range(0, len(titles), batch):
+        chunk = titles[start:start + batch]
+        items = "\n".join(f"{i + 1}. {t[:80]}" for i, t in enumerate(chunk))
+        prompt = AI_RELEVANCE_PROMPT.format(items=items)
+
+        raw, err = "", None
+        for _ in range(max(len(picker.candidates), 1)):
+            model = picker.current()
+            if not model:
+                break
+            raw, err, dead = _call_gemini(prompt, gemini_key, model)
+            if dead:
+                picker.mark_dead(model, err)
+                continue
+            break
+
+        if not raw:
+            errors.append(err or "응답 없음")
+            keep.update(range(start, start + len(chunk)))   # 실패 시 전부 유지
+            continue
+
+        nums = {int(n) for n in re.findall(r"\d{1,3}", raw)}
+        picked = {start + n - 1 for n in nums if 1 <= n <= len(chunk)}
+        if not picked:      # 전부 무관이라는 응답은 오작동 가능성 → 유지
+            errors.append("판정 결과 없음 (전체 유지)")
+            picked = set(range(start, start + len(chunk)))
+        keep.update(picked)
+
+    return keep, errors
+
+
+# ══════════════════════════════════════════════════════════════
 # 페이지 수집
 # ══════════════════════════════════════════════════════════════
 def fetch_html(url: str, timeout: int = 10) -> str:
@@ -1191,6 +1310,15 @@ with st.sidebar:
                      format_func=lambda x: f"최근 {x}시간", index=0)
 
     st.divider()
+    st.write("**관련성 필터**")
+    use_relevance = st.checkbox("관련 없는 기사 걸러내기", value=True,
+                                help="상업용 부동산·기관투자·부동산금융·정책과 "
+                                     "무관한 기사를 목록에서 숨깁니다.")
+    filter_level = st.selectbox("필터 강도", list(FILTER_LEVELS.keys()),
+                                index=1, disabled=not use_relevance)
+    rule_cutoff = FILTER_LEVELS[filter_level]
+
+    st.divider()
     st.write("**중복 제거 민감도**")
     sim_threshold = st.slider("제목 유사도 임계값", 0.5, 0.9, 0.65, 0.05,
                               help="낮을수록 더 많이 제거")
@@ -1300,7 +1428,7 @@ if st.button("🔍 뉴스 수집 시작", type="primary", **FULL_W):
         df = pd.DataFrame()
 
     # 재수집 시 하위 상태 초기화
-    for k in ("editor_df", "mail_html", "collected", "editor"):
+    for k in ("editor_df", "mail_html", "collected", "editor", "restore_editor"):
         st.session_state.pop(k, None)
 
     if df.empty:
@@ -1311,11 +1439,22 @@ if st.button("🔍 뉴스 수집 시작", type="primary", **FULL_W):
         df = df.sort_values(["_r", "발행시각"], ascending=[True, False])
         df = df.drop(columns="_r").reset_index(drop=True)
 
+        # 관련성 점수 산출 + 규칙 기반 1차 제외
+        df["관련도"] = [relevance_score(t, d) for t, d
+                     in zip(df["제목"], df["요약초안"])]
+        df["제외"] = (df["관련도"] < rule_cutoff) if use_relevance else False
+        df["제외사유"] = ["규칙 필터" if x else "" for x in df["제외"]]
+
         st.session_state["collected"] = df
         st.session_state["collect_token"] = dt.datetime.now(KST).isoformat()
-        st.success(f"✅ 총 {len(df)}건 (중복 제거 후 / 원본 {len(all_rows)}건)")
+
+        kept_n = int((~df["제외"]).sum())
+        cut_n = int(df["제외"].sum())
+        st.success(f"✅ 총 {len(df)}건 (중복 제거 후 / 원본 {len(all_rows)}건)"
+                   + (f" · 관련 {kept_n}건 / 제외 {cut_n}건" if cut_n else ""))
         st.dataframe(
-            df["키워드"].value_counts().rename_axis("키워드").reset_index(name="건수"),
+            df[~df["제외"]]["키워드"].value_counts()
+              .rename_axis("키워드").reset_index(name="건수"),
             hide_index=True)
 
         fname = f"뉴스클리핑_{dt.datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx"
@@ -1408,11 +1547,102 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         edit["언론사"] = edit["언론사"].fillna("").apply(
             lambda s: s if str(s).strip() else PRESS_PLACEHOLDER)
         edit["요약"] = edit["요약초안"].fillna("").apply(lambda t: first_sentence(t, 70))
+        if "제외" not in edit.columns:
+            edit["관련도"] = [relevance_score(t, d) for t, d
+                           in zip(edit["제목"], edit["요약초안"])]
+            edit["제외"] = False
+            edit["제외사유"] = ""
         st.session_state["editor_df"] = edit
         st.session_state["editor_token"] = token
 
+    if st.session_state.pop("_flash", None):
+        st.success(st.session_state.pop("_flash_msg", "완료"))
+
+    full_df = st.session_state["editor_df"]
+    visible_df = full_df[~full_df["제외"].astype(bool)]
+    hidden_df = full_df[full_df["제외"].astype(bool)]
+
+    # ── AI 관련성 재판정 ─────────────────────────────────────
+    fc1, fc2 = st.columns([2, 1])
+    ambiguous = visible_df[visible_df["관련도"] < AI_CHECK_BELOW]
+    with fc1:
+        st.caption(f"표시 {len(visible_df)}건 · 규칙으로 제외 {len(hidden_df)}건 · "
+                   f"AI 재판정 대상(관련도 낮음) {len(ambiguous)}건")
+    with fc2:
+        run_ai_filter = st.button(
+            f"🤖 AI로 관련성 재판정 ({len(ambiguous)}건)", **FULL_W,
+            disabled=ambiguous.empty or not (use_gemini and gemini_key),
+            help="제목만 40개씩 묶어 보내므로 호출 수가 적습니다.")
+
+    if run_ai_filter:
+        cands, _e = ([model_override], None) if model_override \
+            else resolve_gemini_candidates(gemini_key)
+        if not cands:
+            st.error("Gemini 모델을 확인할 수 없습니다.")
+        else:
+            picker_f = ModelPicker(cands)
+            titles = ambiguous["제목"].astype(str).tolist()
+            with st.spinner(f"제목 {len(titles)}건 관련성 판정 중..."):
+                keep_pos, ferrs = ai_relevance_check(titles, gemini_key, picker_f)
+            drop_idx = [ix for n, ix in enumerate(ambiguous.index) if n not in keep_pos]
+            new_df = full_df.copy()
+            for ix in drop_idx:
+                new_df.loc[ix, "제외"] = True
+                new_df.loc[ix, "제외사유"] = "AI 판정"
+            st.session_state["editor_df"] = new_df
+            st.session_state.pop("editor", None)
+            st.session_state["_flash"] = True
+            st.session_state["_flash_msg"] = (
+                f"✅ AI 판정 완료 · {len(drop_idx)}건 추가 제외"
+                + (f" (오류 {len(ferrs)}건은 유지)" if ferrs else ""))
+            st.rerun()
+
+    # ── 제외된 기사 확인 · 복원 ───────────────────────────────
+    if not hidden_df.empty:
+        with st.expander(f"🚫 제외된 기사 {len(hidden_df)}건 (확인 · 복원)"):
+            restore_src = hidden_df.copy()
+            restore_src.insert(0, "복원", False)
+            restored = st.data_editor(
+                restore_src, hide_index=True, **FULL_W, height=260,
+                column_order=["복원", "관련도", "제외사유", "제목", "언론사", "링크"],
+                column_config={
+                    "복원": st.column_config.CheckboxColumn("복원", width="small"),
+                    "관련도": st.column_config.NumberColumn("점수", width="small"),
+                    "제외사유": st.column_config.TextColumn("사유", width="small"),
+                    "제목": st.column_config.TextColumn("제목", width=col_width(520)),
+                    "언론사": st.column_config.TextColumn("언론사", width="small"),
+                    "링크": st.column_config.LinkColumn("링크", display_text="열기",
+                                                      width=col_width(70, "small")),
+                },
+                disabled=["관련도", "제외사유", "제목", "언론사", "링크"],
+                key="restore_editor",
+            )
+            rc1, rc2 = st.columns(2)
+            if rc1.button("↩️ 선택한 기사 복원", **FULL_W):
+                back_idx = restored[restored["복원"] == True].index
+                nd = full_df.copy()
+                for ix in back_idx:
+                    nd.loc[ix, "제외"] = False
+                    nd.loc[ix, "제외사유"] = ""
+                st.session_state["editor_df"] = nd
+                for k in ("editor", "restore_editor"):
+                    st.session_state.pop(k, None)
+                st.session_state["_flash"] = True
+                st.session_state["_flash_msg"] = f"✅ {len(back_idx)}건 복원"
+                st.rerun()
+            if rc2.button("↩️ 전체 복원 (필터 해제)", **FULL_W):
+                nd = full_df.copy()
+                nd["제외"] = False
+                nd["제외사유"] = ""
+                st.session_state["editor_df"] = nd
+                for k in ("editor", "restore_editor"):
+                    st.session_state.pop(k, None)
+                st.session_state["_flash"] = True
+                st.session_state["_flash_msg"] = "✅ 전체 복원"
+                st.rerun()
+
     edited_df = st.data_editor(
-        st.session_state["editor_df"],
+        visible_df,
         hide_index=True, **FULL_W, height=460,
         column_order=["선택", "키워드", "제목", "요약",
                       "언론사", "발행시각", "링크"],
@@ -1420,6 +1650,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             "선택": st.column_config.CheckboxColumn("선택", width="small"),
             "키워드": st.column_config.TextColumn("키워드", width=col_width(110, "small")),
             "메일카테고리": None,   # 분류는 생성 시 AI가 결정
+            "관련도": None, "제외": None, "제외사유": None,
             "제목": st.column_config.TextColumn("제목", width=col_width(560)),
             "요약": st.column_config.TextColumn("요약 (직접 수정)", width=col_width(400)),
             "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width=col_width(120, "small")),
