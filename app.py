@@ -141,6 +141,19 @@ PRESS_DOMAIN_MAP = {
     "fntimes.com": "한국금융신문", "insightkorea.co.kr": "인사이트코리아",
     "sisaon.co.kr": "시사오늘", "ekn.kr": "에너지경제", "m-i.kr": "매일일보",
     "smarttoday.co.kr": "스마트투데이", "newsprime.co.kr": "프라임경제",
+    "youthdaily.co.kr": "청년일보", "etoday.co.kr": "이투데이", "cfnews.kr": "CF뉴스",
+    "shinailbo.co.kr": "신아일보", "huffingtonpost.kr": "허프포스트코리아",
+    "dailian.co.kr": "데일리안", "nocutnews.co.kr": "노컷뉴스", "ytn.co.kr": "YTN",
+    "sbs.co.kr": "SBS", "kbs.co.kr": "KBS", "imbc.com": "MBC", "jtbc.co.kr": "JTBC",
+    "mbn.co.kr": "MBN", "koreaherald.com": "코리아헤럴드", "kedglobal.com": "KED Global",
+    "naeil.com": "내일신문", "ilyo.co.kr": "일요신문", "sisajournal.com": "시사저널",
+    "hankyung.com": "한국경제", "wowtv.co.kr": "한국경제TV", "sisaweek.com": "시사위크",
+    "energydaily.co.kr": "에너지데일리", "electimes.com": "전기신문",
+    "kpanews.co.kr": "한국공보뉴스", "worktoday.co.kr": "워크투데이",
+    "getnews.co.kr": "글로벌경제신문", "newstomato.com": "뉴스토마토",
+    "viva100.com": "브릿지경제", "econovill.com": "이코노믹리뷰",
+    "the-pr.co.kr": "더피알", "greened.kr": "녹색경제신문", "biztribune.co.kr": "비즈트리뷴",
+    "topdaily.kr": "탑데일리", "sporbiz.co.kr": "한국스포츠경제",
 }
 
 
@@ -566,8 +579,36 @@ PRESS_META_SELECTORS = [
 ]
 
 
+# 저작권 표기에서 언론사명 추출 (국내 기사 페이지에 거의 항상 존재)
+COPYRIGHT_RE = re.compile(
+    r"(?:저작권자?\s*)?(?:ⓒ|©|\(c\)|Copyright\s*(?:ⓒ|©)?)\s*"
+    r"([가-힣A-Za-z0-9·\.\- ]{2,20})", re.I)
+COPY_TAIL_RE = re.compile(
+    r"\s*(무단|모든|All\s|rights|reserved|재배포|전재|\.|,|\||및|CORP|Inc).*$", re.I)
+
+LOGO_SELECTORS = [
+    "h1.logo img", "a.logo img", ".logo img", "#logo img",
+    "header img[alt]", ".header-logo img", ".site-logo img",
+    "h1 a img[alt]", ".ci img[alt]",
+]
+
+
+def _press_from_copyright(soup) -> str:
+    try:
+        text = soup.get_text(" ")
+    except Exception:
+        return ""
+    for m in COPYRIGHT_RE.finditer(text):
+        cand = COPY_TAIL_RE.sub("", m.group(1)).strip()
+        v = _clean_press_name(cand)
+        # 한글 이름을 우선 채택 (영문 법인명·도메인 회피)
+        if v and re.search(r"[가-힣]", v):
+            return v
+    return ""
+
+
 def press_from_html(soup) -> str:
-    """og:site_name → JSON-LD publisher → <title> 꼬리표 순으로 언론사명 추출."""
+    """메타 → JSON-LD → 저작권 표기 → <title> 꼬리표 → 로고 alt 순으로 추출."""
     for sel, attr in PRESS_META_SELECTORS:
         tag = soup.select_one(sel)
         if tag:
@@ -586,16 +627,27 @@ def press_from_html(soup) -> str:
             if v:
                 return v
 
+    v = _press_from_copyright(soup)
+    if v:
+        return v
+
     try:
         title = soup.title.string if soup.title else ""
     except Exception:
         title = ""
     if title:
-        for sep in (" - ", " | ", " < ", " :: ", " > ", " – "):
+        for sep in (" - ", " | ", " < ", " :: ", " > ", " – ", " — ", " ::: "):
             if sep in title:
                 v = _clean_press_name(title.rsplit(sep, 1)[-1])
                 if v:
                     return v
+
+    for sel in LOGO_SELECTORS:                 # 헤더 로고 이미지의 alt 텍스트
+        tag = soup.select_one(sel)
+        if tag:
+            v = _clean_press_name(tag.get("alt", ""))
+            if v and re.search(r"[가-힣]", v):
+                return v
     return ""
 
 
@@ -1352,7 +1404,32 @@ with st.sidebar:
 
     st.divider()
     st.write("**관련성 필터**")
-    st.caption("컷오프는 아래 목록에서 실시간으로 조절합니다.")
+
+    _s = None
+    for _key in ("editor_df", "collected"):     # 점수가 이미 계산된 쪽을 우선 사용
+        _d = st.session_state.get(_key)
+        if _d is not None and len(_d) and "관련도" in _d.columns:
+            _s = _d["관련도"]
+            break
+    if _s is not None:
+        _lo, _hi = int(_s.min()), int(_s.max())
+    else:
+        _lo, _hi = -10, 20
+    _hi = max(_hi, _lo + 1)
+    # 재수집으로 점수 범위가 바뀌어도 값이 범위를 벗어나지 않도록 보정
+    st.session_state["cutoff"] = min(max(
+        int(st.session_state.get("cutoff", min(5, _hi))), _lo), _hi)
+
+    cutoff = st.slider("최소 관련도", _lo, _hi, key="cutoff",
+                       help="높일수록 목록이 줄어듭니다. 오피스·물류센터·리츠 등이 "
+                            "제목에 있으면 자동으로 +4.")
+    top_n = int(st.number_input("최대 표시 건수", 50, 3000, 300, 50,
+                                help="점수 상위 N건만 표시합니다."))
+    if _s is not None:
+        st.caption("분포 — " + " · ".join(
+            f"{c}점↑ {int((_s >= c).sum())}건"
+            for c in sorted({_lo, 0, 3, 5, 8, 12} & set(range(_lo, _hi + 1)))))
+
     ai_batch = st.slider("AI 판정 묶음 크기", 20, 200, 60, 10,
                          help="한 번에 보낼 제목 수. 크면 호출은 줄지만 목록이 길수록 "
                               "모델이 번호를 헷갈려 오판정 위험이 커집니다. "
@@ -1595,20 +1672,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     full_df = ensure_filter_cols(st.session_state["editor_df"].copy())
     st.session_state["editor_df"] = full_df
 
-    # ── 관련도 컷오프 (실시간) ────────────────────────────────
-    scores = full_df["관련도"]
-    lo, hi = int(scores.min()), int(scores.max())
-    q1, q2 = st.columns([3, 1])
-    cutoff = q1.slider(
-        "최소 관련도 (높일수록 목록이 줄어듭니다)",
-        min_value=lo, max_value=max(hi, lo + 1),
-        value=int(st.session_state.get("cutoff", min(5, max(hi - 3, lo)))),
-        key="cutoff",
-        help="상업용 부동산 관련 신호가 강할수록 점수가 높습니다. "
-             "오피스·물류센터·리츠 등이 제목에 있으면 자동으로 +4.")
-    top_n = int(q2.number_input("최대 표시", 50, 3000, 300, 50,
-                                help="점수 상위 N건만 표시합니다."))
-
+    # ── 관련도 컷오프 (사이드바에서 조절) ──────────────────────
     rule_ok = (full_df["관련도"] >= cutoff) | full_df["복원됨"]
     mask = rule_ok & ~full_df["AI제외"]
     cand = full_df[mask]
@@ -1616,12 +1680,6 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         cand = cand.loc[cand.index.isin(cand.nlargest(top_n, "관련도").index)]
     visible_df = cand
     hidden_df = full_df.drop(index=visible_df.index)
-
-    # 컷오프별 건수 미리보기
-    preview = " · ".join(
-        f"{c}점↑ {int((scores >= c).sum())}건"
-        for c in sorted({lo, 0, 3, 5, 8, 12} & set(range(lo, hi + 1))))
-    st.caption(f"분포 — {preview}")
 
     # ── AI 관련성 재판정 ─────────────────────────────────────
     fc1, fc2 = st.columns([2, 1])
@@ -1835,10 +1893,19 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                  + (f" · 본문 차단 {desc_ai}건은 발췌문으로 AI 요약" if desc_ai else "")
                  + (f" · {naver_fb}건은 발췌문 원문 사용" if naver_fb else ""))
 
-        still_empty = sel_copy[sel_copy["언론사"].astype(str).str.strip()
-                               .isin(["", PRESS_PLACEHOLDER, "nan"])]
+        def _looks_unresolved(v):
+            v = str(v or "").strip()
+            if v in ("", PRESS_PLACEHOLDER, "nan"):
+                return True
+            # 한글이 없고 점이 들어간 값 = 도메인이 그대로 들어간 경우
+            return ("." in v) and not re.search(r"[가-힣]", v)
+
+        still_empty = sel_copy[sel_copy["언론사"].apply(_looks_unresolved)]
         if not still_empty.empty:
-            st.warning(f"⚠️ 언론사 미확인 {len(still_empty)}건 — 위 표에서 직접 입력하세요.")
+            st.warning(
+                f"⚠️ 언론사명을 못 찾아 도메인으로 표시된 기사 {len(still_empty)}건 — "
+                "위 표에서 직접 입력하세요: "
+                + ", ".join(str(v) for v in still_empty["언론사"].unique()[:6]))
 
         if logs:
             st.warning(f"⚠️ {len(logs)}건 문제 발생 (첫 문장으로 대체됨)")
