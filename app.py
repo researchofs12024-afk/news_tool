@@ -420,25 +420,31 @@ def relevance_score(title: str, desc: str = "") -> int:
 
 
 def ensure_filter_cols(df):
-    """이전 버전 세션 데이터에도 관련성 컬럼을 보강 (KeyError 방지)."""
+    """
+    관련성 컬럼 보강 (구버전 세션 호환).
+    관련도 : 규칙 점수
+    AI제외 : AI 판정으로 제외된 건
+    복원됨 : 사용자가 되살린 건 (점수와 무관하게 항상 표시)
+    """
     if df is None or len(df) == 0:
         return df
     if "관련도" not in df.columns:
         descs = df["요약초안"] if "요약초안" in df.columns else [""] * len(df)
         df["관련도"] = [relevance_score(t, d) for t, d in zip(df["제목"], descs)]
-    if "제외" not in df.columns:
-        df["제외"] = False
-    if "제외사유" not in df.columns:
-        df["제외사유"] = ""
-    df["제외"] = df["제외"].fillna(False).astype(bool)
+    if "AI제외" not in df.columns:
+        # 구버전 컬럼(제외/제외사유)에서 이관
+        if "제외사유" in df.columns:
+            df["AI제외"] = df["제외사유"].astype(str).eq("AI 판정")
+        else:
+            df["AI제외"] = False
+    if "복원됨" not in df.columns:
+        df["복원됨"] = False
+    for c in ("AI제외", "복원됨"):
+        df[c] = df[c].fillna(False).astype(bool)
+    df.drop(columns=[c for c in ("제외", "제외사유") if c in df.columns],
+            inplace=True, errors="ignore")
     return df
 
-
-FILTER_LEVELS = {
-    "약하게 (명백한 것만 제외)": -6,
-    "보통 (권장)": -1,
-    "강하게 (애매하면 제외)": 3,
-}
 
 # 이 점수 미만이면 AI 재판정 대상 (명백히 관련된 기사는 호출 낭비 방지)
 AI_CHECK_BELOW = 8
@@ -1346,12 +1352,7 @@ with st.sidebar:
 
     st.divider()
     st.write("**관련성 필터**")
-    use_relevance = st.checkbox("관련 없는 기사 걸러내기", value=True,
-                                help="상업용 부동산·기관투자·부동산금융·정책과 "
-                                     "무관한 기사를 목록에서 숨깁니다.")
-    filter_level = st.selectbox("필터 강도", list(FILTER_LEVELS.keys()),
-                                index=1, disabled=not use_relevance)
-    rule_cutoff = FILTER_LEVELS[filter_level]
+    st.caption("컷오프는 아래 목록에서 실시간으로 조절합니다.")
     ai_batch = st.slider("AI 판정 묶음 크기", 20, 200, 60, 10,
                          help="한 번에 보낼 제목 수. 크면 호출은 줄지만 목록이 길수록 "
                               "모델이 번호를 헷갈려 오판정 위험이 커집니다. "
@@ -1478,23 +1479,22 @@ if st.button("🔍 뉴스 수집 시작", type="primary", **FULL_W):
         df = df.sort_values(["_r", "발행시각"], ascending=[True, False])
         df = df.drop(columns="_r").reset_index(drop=True)
 
-        # 관련성 점수 산출 + 규칙 기반 1차 제외
-        df["관련도"] = [relevance_score(t, d) for t, d
-                     in zip(df["제목"], df["요약초안"])]
-        df["제외"] = (df["관련도"] < rule_cutoff) if use_relevance else False
-        df["제외사유"] = ["규칙 필터" if x else "" for x in df["제외"]]
-
+        df = ensure_filter_cols(df)
         st.session_state["collected"] = df
         st.session_state["collect_token"] = dt.datetime.now(KST).isoformat()
+        st.success(f"✅ 총 {len(df)}건 (중복 제거 후 / 원본 {len(all_rows)}건)")
 
-        kept_n = int((~df["제외"]).sum())
-        cut_n = int(df["제외"].sum())
-        st.success(f"✅ 총 {len(df)}건 (중복 제거 후 / 원본 {len(all_rows)}건)"
-                   + (f" · 관련 {kept_n}건 / 제외 {cut_n}건" if cut_n else ""))
-        st.dataframe(
-            df[~df["제외"]]["키워드"].value_counts()
-              .rename_axis("키워드").reset_index(name="건수"),
-            hide_index=True)
+        with st.expander("🔬 키워드별 수집량·관련도 진단", expanded=True):
+            diag2 = (df.groupby("키워드")
+                       .agg(건수=("제목", "size"),
+                            평균관련도=("관련도", "mean"),
+                            관련도5이상=("관련도", lambda s: int((s >= 5).sum())))
+                       .reset_index()
+                       .sort_values("건수", ascending=False))
+            diag2["평균관련도"] = diag2["평균관련도"].round(1)
+            st.dataframe(diag2, hide_index=True, **FULL_W)
+            st.caption("건수가 많은데 평균 관련도가 낮은 키워드는 노이즈 유발원입니다. "
+                       "위 키워드 편집창에서 좁히거나 제외어(-단어)를 붙여보세요.")
 
         fname = f"뉴스클리핑_{dt.datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button(
@@ -1594,15 +1594,41 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
     full_df = ensure_filter_cols(st.session_state["editor_df"].copy())
     st.session_state["editor_df"] = full_df
-    visible_df = full_df[~full_df["제외"]]
-    hidden_df = full_df[full_df["제외"]]
+
+    # ── 관련도 컷오프 (실시간) ────────────────────────────────
+    scores = full_df["관련도"]
+    lo, hi = int(scores.min()), int(scores.max())
+    q1, q2 = st.columns([3, 1])
+    cutoff = q1.slider(
+        "최소 관련도 (높일수록 목록이 줄어듭니다)",
+        min_value=lo, max_value=max(hi, lo + 1),
+        value=int(st.session_state.get("cutoff", min(5, max(hi - 3, lo)))),
+        key="cutoff",
+        help="상업용 부동산 관련 신호가 강할수록 점수가 높습니다. "
+             "오피스·물류센터·리츠 등이 제목에 있으면 자동으로 +4.")
+    top_n = int(q2.number_input("최대 표시", 50, 3000, 300, 50,
+                                help="점수 상위 N건만 표시합니다."))
+
+    rule_ok = (full_df["관련도"] >= cutoff) | full_df["복원됨"]
+    mask = rule_ok & ~full_df["AI제외"]
+    cand = full_df[mask]
+    if len(cand) > top_n:                       # 점수 상위 N건만 (원래 순서 유지)
+        cand = cand.loc[cand.index.isin(cand.nlargest(top_n, "관련도").index)]
+    visible_df = cand
+    hidden_df = full_df.drop(index=visible_df.index)
+
+    # 컷오프별 건수 미리보기
+    preview = " · ".join(
+        f"{c}점↑ {int((scores >= c).sum())}건"
+        for c in sorted({lo, 0, 3, 5, 8, 12} & set(range(lo, hi + 1))))
+    st.caption(f"분포 — {preview}")
 
     # ── AI 관련성 재판정 ─────────────────────────────────────
     fc1, fc2 = st.columns([2, 1])
     ambiguous = visible_df[visible_df["관련도"] < AI_CHECK_BELOW]
     with fc1:
-        st.caption(f"표시 {len(visible_df)}건 · 규칙으로 제외 {len(hidden_df)}건 · "
-                   f"AI 재판정 대상(관련도 낮음) {len(ambiguous)}건")
+        st.caption(f"표시 {len(visible_df)}건 · 숨김 {len(hidden_df)}건 · "
+                   f"AI 재판정 대상(관련도 {AI_CHECK_BELOW} 미만) {len(ambiguous)}건")
     with fc2:
         run_ai_filter = st.button(
             f"🤖 AI로 관련성 재판정 ({len(ambiguous)}건)", **FULL_W,
@@ -1623,9 +1649,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             fprog.empty()
             drop_idx = [ix for n, ix in enumerate(ambiguous.index) if n not in keep_pos]
             new_df = full_df.copy()
-            for ix in drop_idx:
-                new_df.loc[ix, "제외"] = True
-                new_df.loc[ix, "제외사유"] = "AI 판정"
+            new_df.loc[drop_idx, "AI제외"] = True
+            new_df.loc[drop_idx, "복원됨"] = False
             st.session_state["editor_df"] = new_df
             st.session_state.pop("editor", None)
             st.session_state["_flash"] = True
@@ -1637,46 +1662,51 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
     # ── 제외된 기사 확인 · 복원 ───────────────────────────────
     if not hidden_df.empty:
-        with st.expander(f"🚫 제외된 기사 {len(hidden_df)}건 (확인 · 복원)"):
-            restore_src = hidden_df.copy()
+        with st.expander(f"🚫 숨겨진 기사 {len(hidden_df)}건 (확인 · 복원)"):
+            restore_src = hidden_df.sort_values("관련도", ascending=False).head(300).copy()
             restore_src.insert(0, "복원", False)
+            restore_src["사유"] = ["AI 판정" if a else "관련도 미달"
+                                 for a in restore_src["AI제외"]]
+            if len(hidden_df) > 300:
+                st.caption(f"관련도 상위 300건만 표시 (전체 {len(hidden_df)}건)")
             restored = st.data_editor(
                 restore_src, hide_index=True, **FULL_W, height=260,
-                column_order=["복원", "관련도", "제외사유", "제목", "언론사", "링크"],
+                column_order=["복원", "관련도", "사유", "제목", "언론사", "링크"],
                 column_config={
                     "복원": st.column_config.CheckboxColumn("복원", width="small"),
                     "관련도": st.column_config.NumberColumn("점수", width="small"),
-                    "제외사유": st.column_config.TextColumn("사유", width="small"),
+                    "사유": st.column_config.TextColumn("사유", width="small"),
                     "제목": st.column_config.TextColumn("제목", width=col_width(520)),
                     "언론사": st.column_config.TextColumn("언론사", width="small"),
                     "링크": st.column_config.LinkColumn("링크", display_text="열기",
                                                       width=col_width(70, "small")),
+                    "카테고리": None, "키워드": None, "발행시각": None, "요약": None,
+                    "요약초안": None, "네이버링크": None, "메일카테고리": None,
+                    "선택": None, "AI제외": None, "복원됨": None,
                 },
-                disabled=["관련도", "제외사유", "제목", "언론사", "링크"],
+                disabled=["관련도", "사유", "제목", "언론사", "링크"],
                 key="restore_editor",
             )
             rc1, rc2 = st.columns(2)
             if rc1.button("↩️ 선택한 기사 복원", **FULL_W):
                 back_idx = restored[restored["복원"] == True].index
                 nd = full_df.copy()
-                for ix in back_idx:
-                    nd.loc[ix, "제외"] = False
-                    nd.loc[ix, "제외사유"] = ""
+                nd.loc[back_idx, "복원됨"] = True
+                nd.loc[back_idx, "AI제외"] = False
                 st.session_state["editor_df"] = nd
                 for k in ("editor", "restore_editor"):
                     st.session_state.pop(k, None)
                 st.session_state["_flash"] = True
                 st.session_state["_flash_msg"] = f"✅ {len(back_idx)}건 복원"
                 st.rerun()
-            if rc2.button("↩️ 전체 복원 (필터 해제)", **FULL_W):
+            if rc2.button("↩️ AI 제외 전체 취소", **FULL_W):
                 nd = full_df.copy()
-                nd["제외"] = False
-                nd["제외사유"] = ""
+                nd["AI제외"] = False
                 st.session_state["editor_df"] = nd
                 for k in ("editor", "restore_editor"):
                     st.session_state.pop(k, None)
                 st.session_state["_flash"] = True
-                st.session_state["_flash_msg"] = "✅ 전체 복원"
+                st.session_state["_flash_msg"] = "✅ AI 제외 취소 (관련도 컷오프는 유지)"
                 st.rerun()
 
     edited_df = st.data_editor(
@@ -1688,7 +1718,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             "선택": st.column_config.CheckboxColumn("선택", width="small"),
             "키워드": st.column_config.TextColumn("키워드", width=col_width(110, "small")),
             "메일카테고리": None,   # 분류는 생성 시 AI가 결정
-            "관련도": None, "제외": None, "제외사유": None,
+            "관련도": None, "AI제외": None, "복원됨": None,
             "제목": st.column_config.TextColumn("제목", width=col_width(560)),
             "요약": st.column_config.TextColumn("요약 (직접 수정)", width=col_width(400)),
             "언론사": st.column_config.TextColumn("언론사 (직접 수정)", width=col_width(120, "small")),
