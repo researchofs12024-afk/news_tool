@@ -419,6 +419,21 @@ def relevance_score(title: str, desc: str = "") -> int:
     return int(score)
 
 
+def ensure_filter_cols(df):
+    """이전 버전 세션 데이터에도 관련성 컬럼을 보강 (KeyError 방지)."""
+    if df is None or len(df) == 0:
+        return df
+    if "관련도" not in df.columns:
+        descs = df["요약초안"] if "요약초안" in df.columns else [""] * len(df)
+        df["관련도"] = [relevance_score(t, d) for t, d in zip(df["제목"], descs)]
+    if "제외" not in df.columns:
+        df["제외"] = False
+    if "제외사유" not in df.columns:
+        df["제외사유"] = ""
+    df["제외"] = df["제외"].fillna(False).astype(bool)
+    return df
+
+
 FILTER_LEVELS = {
     "약하게 (명백한 것만 제외)": -6,
     "보통 (권장)": -1,
@@ -1536,7 +1551,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.header("✉️ 메일 배포용 정리")
     st.caption("배포할 기사를 선택하고 카테고리를 지정한 뒤 요약을 다듬으세요.")
 
-    base = st.session_state["collected"].copy()
+    base = ensure_filter_cols(st.session_state["collected"].copy())
     token = st.session_state.get("collect_token", "")
 
     if st.session_state.get("editor_token") != token:
@@ -1547,20 +1562,16 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         edit["언론사"] = edit["언론사"].fillna("").apply(
             lambda s: s if str(s).strip() else PRESS_PLACEHOLDER)
         edit["요약"] = edit["요약초안"].fillna("").apply(lambda t: first_sentence(t, 70))
-        if "제외" not in edit.columns:
-            edit["관련도"] = [relevance_score(t, d) for t, d
-                           in zip(edit["제목"], edit["요약초안"])]
-            edit["제외"] = False
-            edit["제외사유"] = ""
-        st.session_state["editor_df"] = edit
+        st.session_state["editor_df"] = ensure_filter_cols(edit)
         st.session_state["editor_token"] = token
 
     if st.session_state.pop("_flash", None):
         st.success(st.session_state.pop("_flash_msg", "완료"))
 
-    full_df = st.session_state["editor_df"]
-    visible_df = full_df[~full_df["제외"].astype(bool)]
-    hidden_df = full_df[full_df["제외"].astype(bool)]
+    full_df = ensure_filter_cols(st.session_state["editor_df"].copy())
+    st.session_state["editor_df"] = full_df
+    visible_df = full_df[~full_df["제외"]]
+    hidden_df = full_df[full_df["제외"]]
 
     # ── AI 관련성 재판정 ─────────────────────────────────────
     fc1, fc2 = st.columns([2, 1])
