@@ -1549,7 +1549,7 @@ def build_mail_html(sel_df):
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
-    st.caption("배포할 기사를 선택하고 카테고리를 지정한 뒤 요약을 다듬으세요.")
+    st.caption("배포할 기사를 선택하고 메일본문을 생성하면 Gemini로 기사를 요약합니다.")
 
     base = ensure_filter_cols(st.session_state["collected"].copy())
     token = st.session_state.get("collect_token", "")
@@ -1581,9 +1581,9 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                    f"AI 재판정 대상(관련도 낮음) {len(ambiguous)}건")
     with fc2:
         run_ai_filter = st.button(
-            f"🤖 AI로 관련성 재판정 ({len(ambiguous)}건)", **FULL_W,
+            f"🤖 AI로 관련성 리스트 정리 ({len(ambiguous)}건)", **FULL_W,
             disabled=ambiguous.empty or not (use_gemini and gemini_key),
-            help="제목만 40개씩 묶어 보내므로 호출 수가 적습니다.")
+            help="Gemini로 중복 기사 리스트를 제거합니다")
 
     if run_ai_filter:
         cands, _e = ([model_override], None) if model_override \
