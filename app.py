@@ -460,40 +460,58 @@ AI_RELEVANCE_PROMPT = """아래는 뉴스 제목 목록이다. 이 중에서 '�
 예시 출력: 1,3,4,9"""
 
 
-def ai_relevance_check(titles, gemini_key, picker, batch=40):
+def ai_relevance_check(titles, gemini_key, picker, batch=60, progress=None):
     """
     제목을 묶어 Gemini에 관련성 판정 요청.
     반환: (관련 있다고 판정된 위치 집합, 에러목록)
-    판정 실패한 배치는 전부 '관련'으로 간주해 기사를 잃지 않는다.
+
+    안전장치 — 아래 경우는 해당 배치를 통째로 '관련'으로 두어 기사를 잃지 않는다.
+      · 호출 실패 / 응답 없음 (출력 토큰 초과로 잘린 경우 포함)
+      · 판정 번호가 하나도 없음
+      · 남긴 비율이 15% 미만 (인덱스 밀림 등 오작동 의심)
     """
     keep, errors = set(), []
-    for start in range(0, len(titles), batch):
+    total_batches = max((len(titles) + batch - 1) // batch, 1)
+
+    for bi, start in enumerate(range(0, len(titles), batch), start=1):
         chunk = titles[start:start + batch]
         items = "\n".join(f"{i + 1}. {t[:80]}" for i, t in enumerate(chunk))
         prompt = AI_RELEVANCE_PROMPT.format(items=items)
+        # 번호 나열 길이에 맞춰 출력 상한 확보 (잘림 방지)
+        out_cap = min(300 + len(chunk) * 6, 4000)
 
         raw, err = "", None
         for _ in range(max(len(picker.candidates), 1)):
             model = picker.current()
             if not model:
                 break
-            raw, err, dead = _call_gemini(prompt, gemini_key, model)
+            raw, err, dead = _call_gemini(prompt, gemini_key, model, max_tokens=out_cap)
             if dead:
                 picker.mark_dead(model, err)
                 continue
             break
 
-        if not raw:
-            errors.append(err or "응답 없음")
-            keep.update(range(start, start + len(chunk)))   # 실패 시 전부 유지
-            continue
+        all_pos = set(range(start, start + len(chunk)))
 
-        nums = {int(n) for n in re.findall(r"\d{1,3}", raw)}
-        picked = {start + n - 1 for n in nums if 1 <= n <= len(chunk)}
-        if not picked:      # 전부 무관이라는 응답은 오작동 가능성 → 유지
-            errors.append("판정 결과 없음 (전체 유지)")
-            picked = set(range(start, start + len(chunk)))
-        keep.update(picked)
+        if not raw:
+            errors.append(f"배치{bi}: {err or '응답 없음'} → 전체 유지")
+            keep.update(all_pos)
+        else:
+            nums = {int(n) for n in re.findall(r"\d{1,4}", raw)}
+            picked = {start + n - 1 for n in nums if 1 <= n <= len(chunk)}
+            ratio = len(picked) / max(len(chunk), 1)
+            if not picked:
+                errors.append(f"배치{bi}: 판정 번호 없음 → 전체 유지")
+                keep.update(all_pos)
+            elif ratio < 0.15:
+                errors.append(f"배치{bi}: 유지율 {ratio:.0%}로 비정상 → 전체 유지")
+                keep.update(all_pos)
+            else:
+                keep.update(picked)
+
+        if progress is not None:
+            progress.progress(bi / total_batches,
+                              text=f"관련성 판정 중... (배치 {bi}/{total_batches})")
 
     return keep, errors
 
@@ -1111,7 +1129,7 @@ def _quota_reason(body: str):
     return "원인 미상", False
 
 
-def _call_gemini(prompt: str, gemini_key: str, model_name: str):
+def _call_gemini(prompt: str, gemini_key: str, model_name: str, max_tokens: int = 0):
     """
     단일 호출 + 재시도. 반환: (원문텍스트, 에러, 모델폐기여부)
 
@@ -1122,8 +1140,10 @@ def _call_gemini(prompt: str, gemini_key: str, model_name: str):
     headers = {"Content-Type": "application/json", "x-goog-api-key": gemini_key}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
+    cap = max_tokens if max_tokens > 0 else MAX_OUTPUT_TOKENS
+
     def build(thinking_off: bool):
-        gc = {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 0.3}
+        gc = {"maxOutputTokens": cap, "temperature": 0.3}
         if thinking_off:
             gc["thinkingConfig"] = {"thinkingBudget": 0}
         return {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gc}
@@ -1332,6 +1352,10 @@ with st.sidebar:
     filter_level = st.selectbox("필터 강도", list(FILTER_LEVELS.keys()),
                                 index=1, disabled=not use_relevance)
     rule_cutoff = FILTER_LEVELS[filter_level]
+    ai_batch = st.slider("AI 판정 묶음 크기", 20, 200, 60, 10,
+                         help="한 번에 보낼 제목 수. 크면 호출은 줄지만 목록이 길수록 "
+                              "모델이 번호를 헷갈려 오판정 위험이 커집니다. "
+                              "150 이상은 권장하지 않습니다.")
 
     st.divider()
     st.write("**중복 제거 민감도**")
@@ -1549,7 +1573,7 @@ def build_mail_html(sel_df):
 if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.divider()
     st.header("✉️ 메일 배포용 정리")
-    st.caption("배포할 기사를 선택하고 메일본문을 생성하면 Gemini로 기사를 요약합니다.")
+    st.caption("배포할 기사를 선택하고 카테고리를 지정한 뒤 요약을 다듬으세요.")
 
     base = ensure_filter_cols(st.session_state["collected"].copy())
     token = st.session_state.get("collect_token", "")
@@ -1581,9 +1605,9 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                    f"AI 재판정 대상(관련도 낮음) {len(ambiguous)}건")
     with fc2:
         run_ai_filter = st.button(
-            f"🤖 AI로 관련성 리스트 정리 ({len(ambiguous)}건)", **FULL_W,
+            f"🤖 AI로 관련성 재판정 ({len(ambiguous)}건)", **FULL_W,
             disabled=ambiguous.empty or not (use_gemini and gemini_key),
-            help="Gemini로 중복 기사 리스트를 제거합니다")
+            help="제목만 40개씩 묶어 보내므로 호출 수가 적습니다.")
 
     if run_ai_filter:
         cands, _e = ([model_override], None) if model_override \
@@ -1593,8 +1617,10 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         else:
             picker_f = ModelPicker(cands)
             titles = ambiguous["제목"].astype(str).tolist()
-            with st.spinner(f"제목 {len(titles)}건 관련성 판정 중..."):
-                keep_pos, ferrs = ai_relevance_check(titles, gemini_key, picker_f)
+            fprog = st.progress(0.0, text="관련성 판정 중...")
+            keep_pos, ferrs = ai_relevance_check(
+                titles, gemini_key, picker_f, batch=ai_batch, progress=fprog)
+            fprog.empty()
             drop_idx = [ix for n, ix in enumerate(ambiguous.index) if n not in keep_pos]
             new_df = full_df.copy()
             for ix in drop_idx:
@@ -1605,7 +1631,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             st.session_state["_flash"] = True
             st.session_state["_flash_msg"] = (
                 f"✅ AI 판정 완료 · {len(drop_idx)}건 추가 제외"
-                + (f" (오류 {len(ferrs)}건은 유지)" if ferrs else ""))
+                + (f"\n\n⚠️ 이상 배치 {len(ferrs)}건은 전체 유지: "
+                   + " / ".join(ferrs[:3]) if ferrs else ""))
             st.rerun()
 
     # ── 제외된 기사 확인 · 복원 ───────────────────────────────
