@@ -109,6 +109,31 @@ def col_width(px: int, fallback: str = "large"):
     return px if PX_WIDTH_OK else fallback
 
 
+# st.components.v1.html 은 폐기 예정(1.65에서 경고, 이후 삭제) → st.html 우선 사용
+try:
+    _HTML_JS_OK = "unsafe_allow_javascript" in _inspect.signature(st.html).parameters
+except Exception:
+    _HTML_JS_OK = False
+
+
+def render_html(body: str, height: int = 100, js: bool = False):
+    """HTML 렌더링. 신버전은 st.html, 구버전은 components.v1.html 로 폴백."""
+    if _HTML_JS_OK:
+        st.html(body, unsafe_allow_javascript=js)
+    else:
+        import streamlit.components.v1 as _components
+        _components.html(body, height=height, scrolling=True)
+
+
+EDITOR_PREFIX = "ed_tbl_"
+
+
+def reset_editor_widgets():
+    """기사 선택 표의 위젯 상태 초기화 (데이터는 editor_df에 보존)."""
+    for k in [k for k in list(st.session_state.keys()) if str(k).startswith(EDITOR_PREFIX)]:
+        st.session_state.pop(k, None)
+
+
 def clean(text: str) -> str:
     """HTML 태그·엔티티 제거 후 공백 정리."""
     if not text:
@@ -1545,8 +1570,9 @@ if st.button("🔍 뉴스 수집 시작", type="primary", **FULL_W):
         df = pd.DataFrame()
 
     # 재수집 시 하위 상태 초기화
-    for k in ("editor_df", "mail_html", "collected", "editor", "restore_editor"):
+    for k in ("editor_df", "mail_html", "collected", "restore_editor"):
         st.session_state.pop(k, None)
+    reset_editor_widgets()
 
     if df.empty:
         st.warning("수집된 기사가 없습니다.")
@@ -1691,7 +1717,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
         run_ai_filter = st.button(
             f"🤖 AI로 관련성 재판정 ({len(ambiguous)}건)", **FULL_W,
             disabled=ambiguous.empty or not (use_gemini and gemini_key),
-            help="제목만 40개씩 묶어 보내므로 호출 수가 적습니다.")
+            help=f"제목만 {ai_batch}개씩 묶어 보내므로 호출 수가 적습니다.")
 
     if run_ai_filter:
         cands, _e = ([model_override], None) if model_override \
@@ -1710,7 +1736,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             new_df.loc[drop_idx, "AI제외"] = True
             new_df.loc[drop_idx, "복원됨"] = False
             st.session_state["editor_df"] = new_df
-            st.session_state.pop("editor", None)
+            reset_editor_widgets()
             st.session_state["_flash"] = True
             st.session_state["_flash_msg"] = (
                 f"✅ AI 판정 완료 · {len(drop_idx)}건 추가 제외"
@@ -1752,8 +1778,8 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 nd.loc[back_idx, "복원됨"] = True
                 nd.loc[back_idx, "AI제외"] = False
                 st.session_state["editor_df"] = nd
-                for k in ("editor", "restore_editor"):
-                    st.session_state.pop(k, None)
+                reset_editor_widgets()
+                st.session_state.pop("restore_editor", None)
                 st.session_state["_flash"] = True
                 st.session_state["_flash_msg"] = f"✅ {len(back_idx)}건 복원"
                 st.rerun()
@@ -1761,12 +1787,16 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
                 nd = full_df.copy()
                 nd["AI제외"] = False
                 st.session_state["editor_df"] = nd
-                for k in ("editor", "restore_editor"):
-                    st.session_state.pop(k, None)
+                reset_editor_widgets()
+                st.session_state.pop("restore_editor", None)
                 st.session_state["_flash"] = True
                 st.session_state["_flash_msg"] = "✅ AI 제외 취소 (관련도 컷오프는 유지)"
                 st.rerun()
 
+    # data_editor는 편집 내용을 '행 위치'로 기억한다. 컷오프·AI 판정·복원으로
+    # 표시 목록이 바뀌면 체크가 엉뚱한 기사로 옮겨가므로, 목록 구성이 바뀔 때마다
+    # 위젯 키를 새로 만들고 편집 결과는 매번 전체 표(editor_df)에 저장해 보존한다.
+    vis_sig = abs(hash(tuple(visible_df.index.tolist()))) % 10**10
     edited_df = st.data_editor(
         visible_df,
         hide_index=True, **FULL_W, height=460,
@@ -1786,8 +1816,17 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             "요약초안": None, "카테고리": None, "네이버링크": None,
         },
         disabled=["제목", "키워드", "발행시각", "링크"],
-        key="editor",
+        key=f"{EDITOR_PREFIX}{vis_sig}",
     )
+
+    # 편집 결과(선택·요약·언론사)를 전체 표에 즉시 반영
+    _keep_cols = ["선택", "요약", "언론사"]
+    full_df.loc[edited_df.index, _keep_cols] = edited_df[_keep_cols].values
+    st.session_state["editor_df"] = full_df
+    # 이전 목록 구성의 위젯 상태는 정리 (세션 비대화 방지)
+    for k in [k for k in list(st.session_state.keys())
+              if str(k).startswith(EDITOR_PREFIX) and k != f"{EDITOR_PREFIX}{vis_sig}"]:
+        st.session_state.pop(k, None)
 
     sel = edited_df[edited_df["선택"] == True].copy()   # 원본 인덱스 유지
     st.write(f"선택된 기사: **{len(sel)}건**")
@@ -1925,6 +1964,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             for col in ("요약", "언론사", "제목", "메일카테고리"):
                 back.loc[idx, col] = sel_copy.loc[idx, col]
         st.session_state["editor_df"] = back
+        reset_editor_widgets()
 
         st.success("✅ 메일 본문이 생성되었습니다.")
 
@@ -1935,44 +1975,53 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
 
         import json as _json
         html_js = _json.dumps(mail_html)
+        # st.html은 iframe 없이 본 페이지에서 스크립트를 실행하므로
+        # 재실행마다 변수 재선언 오류가 나지 않게 IIFE + 고유 id 사용
+        uid = f"mc{abs(hash(mail_html)) % 10**8}"
         copy_widget = f"""
-        <div id="src" style="position:absolute;left:-9999px;top:-9999px;">{mail_html}</div>
+        <div id="{uid}_src" style="position:absolute;left:-9999px;top:-9999px;">{mail_html}</div>
         <div style="font-family:'맑은 고딕',sans-serif;">
-          <button id="copyBtn" style="padding:10px 18px;font-size:14px;
+          <button id="{uid}_btn" style="padding:10px 18px;font-size:14px;
               background:#ff4b4b;color:#fff;border:none;border-radius:6px;
               cursor:pointer;width:100%;font-weight:bold;">
             📋 메일 본문 복사 (서식 유지)
           </button>
-          <span id="copyMsg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
+          <span id="{uid}_msg" style="margin-left:10px;color:#0a0;font-weight:bold;"></span>
         </div>
         <script>
-        const htmlStr = {html_js};
-        document.getElementById('copyBtn').addEventListener('click', async () => {{
-          const src = document.getElementById('src');
-          try {{
-            await navigator.clipboard.write([new ClipboardItem({{
-              'text/html': new Blob([htmlStr], {{type: 'text/html'}}),
-              'text/plain': new Blob([src.innerText], {{type: 'text/plain'}})
-            }})]);
-            document.getElementById('copyMsg').innerText = '✓ 복사됨! 메일에 붙여넣으세요';
-          }} catch (e) {{
-            const range = document.createRange();
-            range.selectNode(src);
-            window.getSelection().removeAllRanges();
-            window.getSelection().addRange(range);
-            document.execCommand('copy');
-            window.getSelection().removeAllRanges();
-            document.getElementById('copyMsg').innerText = '✓ 복사됨 (폴백)';
-          }}
-        }});
+        (function() {{
+          const htmlStr = {html_js};
+          const btn = document.getElementById('{uid}_btn');
+          if (!btn || btn.dataset.bound) return;
+          btn.dataset.bound = '1';
+          btn.addEventListener('click', async () => {{
+            const src = document.getElementById('{uid}_src');
+            const msg = document.getElementById('{uid}_msg');
+            try {{
+              await navigator.clipboard.write([new ClipboardItem({{
+                'text/html': new Blob([htmlStr], {{type: 'text/html'}}),
+                'text/plain': new Blob([src.innerText], {{type: 'text/plain'}})
+              }})]);
+              msg.innerText = '✓ 복사됨! 메일에 붙여넣으세요';
+            }} catch (e) {{
+              const range = document.createRange();
+              range.selectNode(src);
+              window.getSelection().removeAllRanges();
+              window.getSelection().addRange(range);
+              document.execCommand('copy');
+              window.getSelection().removeAllRanges();
+              msg.innerText = '✓ 복사됨 (폴백)';
+            }}
+          }});
+        }})();
         </script>
         """
-        st.components.v1.html(copy_widget, height=100, scrolling=False)
+        render_html(copy_widget, height=100, js=True)
 
         with st.expander("📨 메일 본문 미리보기", expanded=True):
-            st.components.v1.html(
-                f"<div style=\"font-family:'맑은 고딕',sans-serif;\">{mail_html}</div>",
-                height=500, scrolling=True)
+            render_html(
+                "<div style=\"font-family:'맑은 고딕',sans-serif;max-height:500px;"
+                f"overflow:auto;\">{mail_html}</div>", height=500)
 
         full_html = ("<!doctype html><html><head><meta charset='utf-8'></head><body>"
                      + mail_html + "</body></html>")
