@@ -126,12 +126,14 @@ def render_html(body: str, height: int = 100, js: bool = False):
 
 
 EDITOR_PREFIX = "ed_tbl_"
+SNAPSHOT_KEY = "_ed_snapshot"
 
 
 def reset_editor_widgets():
-    """기사 선택 표의 위젯 상태 초기화 (데이터는 editor_df에 보존)."""
+    """기사 선택 표의 위젯 상태·스냅샷 초기화 (데이터는 editor_df에 보존)."""
     for k in [k for k in list(st.session_state.keys()) if str(k).startswith(EDITOR_PREFIX)]:
         st.session_state.pop(k, None)
+    st.session_state.pop(SNAPSHOT_KEY, None)
 
 
 def clean(text: str) -> str:
@@ -1797,8 +1799,18 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     # 표시 목록이 바뀌면 체크가 엉뚱한 기사로 옮겨가므로, 목록 구성이 바뀔 때마다
     # 위젯 키를 새로 만들고 편집 결과는 매번 전체 표(editor_df)에 저장해 보존한다.
     vis_sig = abs(hash(tuple(visible_df.index.tolist()))) % 10**10
+    ed_key = f"{EDITOR_PREFIX}{vis_sig}"
+
+    # 표에 넘기는 데이터가 바뀌면 표가 새로 그려지며 스크롤이 맨 위로 튄다.
+    # → 목록 구성이 같은 동안은 처음 만든 스냅샷을 그대로 넘기고,
+    #   체크·수정 내용은 위젯 상태(편집분)로만 유지한다.
+    snap = st.session_state.get(SNAPSHOT_KEY)
+    if snap is None or snap[0] != ed_key:
+        st.session_state[SNAPSHOT_KEY] = (ed_key, visible_df.copy())
+    editor_input = st.session_state[SNAPSHOT_KEY][1]
+
     edited_df = st.data_editor(
-        visible_df,
+        editor_input,
         hide_index=True, **FULL_W, height=460,
         column_order=["선택", "키워드", "제목", "요약",
                       "언론사", "발행시각", "링크"],
@@ -1816,7 +1828,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
             "요약초안": None, "카테고리": None, "네이버링크": None,
         },
         disabled=["제목", "키워드", "발행시각", "링크"],
-        key=f"{EDITOR_PREFIX}{vis_sig}",
+        key=ed_key,
     )
 
     # 편집 결과(선택·요약·언론사)를 전체 표에 즉시 반영
@@ -1825,7 +1837,7 @@ if "collected" in st.session_state and not st.session_state["collected"].empty:
     st.session_state["editor_df"] = full_df
     # 이전 목록 구성의 위젯 상태는 정리 (세션 비대화 방지)
     for k in [k for k in list(st.session_state.keys())
-              if str(k).startswith(EDITOR_PREFIX) and k != f"{EDITOR_PREFIX}{vis_sig}"]:
+              if str(k).startswith(EDITOR_PREFIX) and k != ed_key]:
         st.session_state.pop(k, None)
 
     sel = edited_df[edited_df["선택"] == True].copy()   # 원본 인덱스 유지
